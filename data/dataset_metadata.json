@@ -1,0 +1,43 @@
+{
+  "1pagedataseteeeeeeee": {
+    "description": "",
+    "author": "Jean Valjean",
+    "topic": "Competition Law EU",
+    "linkedin_url": "https://www.linkedin.com/in/andriuspetrenas/",
+    "custom_instructions": "",
+    "created_at": "2025-05-28T23:17:16.250776",
+    "last_update_date": "2025-05-28T23:17:16.250776",
+    "document_count": 3,
+    "page_count": 160
+  },
+  "EU-International-Sanctionsddd": {
+    "description": "",
+    "author": "Jean Valjean",
+    "topic": "Competition Law EU",
+    "custom_instructions": "Answer in a funny manner",
+    "created_at": "2025-05-29T00:02:59.767157",
+    "last_update_date": "2025-05-29T00:11:27.701413",
+    "document_count": 2,
+    "page_count": 54
+  },
+  "WordV1": {
+    "description": "",
+    "author": "Jean Valjean",
+    "topic": "Competition Law EU",
+    "custom_instructions": "Answer in a funny manner using the context provided.",
+    "created_at": "2025-05-29T00:12:28.843431",
+    "last_update_date": "2025-05-29T00:13:37.054956",
+    "document_count": 1,
+    "page_count": 48
+  },
+  "WordiesV2": {
+    "description": "",
+    "author": "Jean Valjean",
+    "topic": "Competition Law EU",
+    "custom_instructions": "Start your answer by \"Please sir\"",
+    "created_at": "2025-05-29T00:16:46.482107",
+    "last_update_date": "2025-05-29T00:19:08.928859",
+    "document_count": 2,
+    "page_count": 200
+  }
+}
