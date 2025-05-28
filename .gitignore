@@ -29,15 +29,19 @@ env/
 env.bak/
 venv.bak/
 
-# Environment Variables
+# Environment Variables and Local Configuration
 .env
 .env.*
 !.env.example
+local_settings.py
+config.local.py
+settings.local.json
 
-# Logs
+# Logs (keep logging configuration, ignore log files)
 logs/
 *.log
 app.log
+*.log.*
 
 # Database
 *.db
@@ -101,3 +105,63 @@ tools/
 *.zip
 *.tar.gz
 *.rar
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+*.sublime-workspace
+*.sublime-project
+
+# Data directories (keep structure but ignore contents)
+data/documents/*
+data/uploads/*
+data/users/*
+data/transactions/*
+data/embeddings/*
+data/chroma/*
+data/encrypted/*
+data/temp/*
+data/keys/*
+data/audit_logs/*
+data/feedback/*
+data/chat_history/*
+data/dataset_metadata.json
+data/users/user_index.json
+
+# Keep directories but ignore contents
+!data/documents/.gitkeep
+!data/uploads/.gitkeep
+!data/users/.gitkeep
+!data/transactions/.gitkeep
+!data/embeddings/.gitkeep
+!data/chroma/.gitkeep
+!data/encrypted/.gitkeep
+!data/temp/.gitkeep
+!data/keys/.gitkeep
+!data/audit_logs/.gitkeep
+!data/feedback/.gitkeep
+!data/chat_history/.gitkeep
+
+# Development tools
+.claude/
+tools/
+
+# Documentation (development)
+tasks.md
+*.mdx
+*.md.bak
+
+# Backup files
+*.bak
+*.backup
+*~
+*.old
