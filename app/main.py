@@ -76,6 +76,13 @@ CORS(app)
 # Initialize Chroma
 chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
 
+# Set HNSW parameters for better performance with larger datasets
+HNSW_CONFIG = {
+    "M": 128,  # Maximum number of connections per element
+    "ef_construction": 400,  # Size of the dynamic candidate list during construction
+    "ef_search": 200  # Size of the dynamic candidate list during search
+}
+
 # Initialize embeddings
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
@@ -171,7 +178,7 @@ def save_dataset_metadata(metadata):
 # Configure file uploads
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "data", "uploads")
 ALLOWED_EXTENSIONS = {'pdf', 'txt'}
-MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
+MAX_CONTENT_LENGTH = 300 * 1024 * 1024  # 300MB total limit for dataset documents (no per-file limit)
 
 # Create upload folder if it doesn't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -370,6 +377,13 @@ def chat():
             formatted_history.append({"role": msg["role"], "content": msg["content"]})
     
     try:
+        # Log the full prompt for debugging
+        print("\n--- LLM PROMPT DEBUG ---")
+        print("System message:")
+        print(system_message)
+        print("\nChat history:")
+        print(formatted_history[-10:] if formatted_history else [])
+        print("--- END LLM PROMPT DEBUG ---\n")
         # Call LLM API with enhanced prompt
         response = llm_client.generate_with_rag(
             query=user_message,
@@ -411,7 +425,14 @@ def get_datasets():
             # Count documents in collection
             try:
                 coll = chroma_client.get_collection(name=name)
-                doc_count = coll.count()
+                # Get all documents from collection to count unique sources
+                results = coll.get(include=["metadatas"])
+                unique_sources = set()
+                for meta in results["metadatas"]:
+                    source = meta.get("source")
+                    if source:
+                        unique_sources.add(source)
+                doc_count = len(unique_sources)  # Count unique documents
                 metadata = dataset_metadata.get(name, {})
                 description = metadata.get("description", f"Custom dataset with {doc_count} entries")
                 author = metadata.get("author")
@@ -419,8 +440,8 @@ def get_datasets():
                 linkedin_url = metadata.get("linkedin_url")
                 custom_instructions = metadata.get("custom_instructions")
                 last_update_date = metadata.get("last_update_date")
+                # Use document_count from metadata if available, otherwise use our calculated doc_count
                 document_count = metadata.get("document_count", doc_count)
-                page_count = metadata.get("page_count", 0)
                 all_datasets.append({
                     "name": name, 
                     "description": description,
@@ -430,7 +451,6 @@ def get_datasets():
                     "custom_instructions": custom_instructions,
                     "last_update_date": last_update_date,
                     "document_count": document_count,
-                    "page_count": page_count,
                     "is_custom": True
                 })
             except Exception as e:
@@ -488,7 +508,10 @@ def create_dataset():
             pass
 
         # Create the collection
-        collection = chroma_client.create_collection(name=sanitized_name)
+        collection = chroma_client.create_collection(
+            name=sanitized_name,
+            hnsw_config=HNSW_CONFIG
+        )
 
         # Store metadata
         current_time = datetime.now().isoformat()
@@ -501,8 +524,7 @@ def create_dataset():
             "custom_instructions": data.get('custom_instructions', ''),
             "created_at": current_time,
             "last_update_date": current_time,
-            "document_count": 0,
-            "page_count": 0
+            "document_count": 0
         }
         save_dataset_metadata(dataset_metadata)
 
@@ -518,7 +540,6 @@ def create_dataset():
                 "custom_instructions": data.get('custom_instructions', ''),
                 "is_custom": True,
                 "document_count": 0,
-                "page_count": 0,
                 "last_update_date": current_time
             }
         })
@@ -586,17 +607,53 @@ def delete_dataset(dataset_name):
 @app.route('/api/datasets/<dataset_name>', methods=['PUT'])
 def update_dataset_metadata_route(dataset_name):
     """Update metadata for an existing dataset."""
+    print(f"[DEBUG] Incoming update for dataset_name: '{dataset_name}'")
     data_to_update = request.json
     if not data_to_update:
         return jsonify({"error": "No data provided for update"}), 400
 
     dataset_metadata = load_dataset_metadata()
+    print(f"[DEBUG] Available dataset_metadata keys: {list(dataset_metadata.keys())}")
+
+    # Check if dataset exists in Chroma
+    try:
+        collection = chroma_client.get_collection(name=dataset_name)
+        exists_in_chroma = True
+        # Get document count from Chroma
+        results = collection.get(include=["metadatas"])
+        unique_sources = set()
+        for meta in results["metadatas"]:
+            source = meta.get("source")
+            if source:
+                unique_sources.add(source)
+        doc_count = len(unique_sources)
+    except Exception:
+        exists_in_chroma = False
+        doc_count = 0
 
     if dataset_name not in dataset_metadata:
-        # Also check if it's a default dataset, which shouldn't be "updated" via this mechanism
-        if any(d['name'] == dataset_name for d in DEFAULT_DATASETS):
-             return jsonify({"error": "Default datasets cannot be modified."}), 403
-        return jsonify({"error": "Dataset not found"}), 404
+        # If dataset exists in Chroma but not in metadata, auto-create a minimal entry
+        if exists_in_chroma:
+            current_time = datetime.now().isoformat()
+            dataset_metadata[dataset_name] = {
+                "description": "",
+                "author": "",
+                "topic": "",
+                "linkedin_url": "",
+                "custom_instructions": "",
+                "created_at": current_time,
+                "last_update_date": current_time,
+                "document_count": doc_count  # Use the document count from Chroma
+            }
+            save_dataset_metadata(dataset_metadata)
+            print(f"[DEBUG] Auto-created metadata entry for dataset: '{dataset_name}' with document_count: {doc_count}")
+        else:
+            # If dataset does not exist in Chroma, return 404
+            return jsonify({"error": "Dataset not found"}), 404
+
+    # Also check if it's a default dataset, which shouldn't be "updated" via this mechanism
+    if any(d['name'] == dataset_name for d in DEFAULT_DATASETS):
+        return jsonify({"error": "Default datasets cannot be modified."}), 403
 
     # Update only the allowed fields
     # Ensure all expected fields are present even if empty, to allow clearing them
@@ -765,12 +822,14 @@ def upload_documents():
                 pass
 
             # Create collection
-            collection = chroma_client.create_collection(name=dataset_name)
+            collection = chroma_client.create_collection(
+                name=sanitized_name,
+                hnsw_config=HNSW_CONFIG
+            )
             
             # Process uploaded files
             files = request.files.getlist('files')
             total_documents = len(files)
-            total_pages = 0
             documents = []
             metadatas = []
             ids = []
@@ -784,7 +843,6 @@ def upload_documents():
                     try:
                         if filename.endswith('.pdf'):
                             extracted_texts = robust_extract_text_from_pdf(file_path)
-                            total_pages += len(extracted_texts)
                             for j, text in enumerate(extracted_texts):
                                 if text and len(text) > 50:
                                     documents.append(text)
@@ -793,7 +851,6 @@ def upload_documents():
                         elif filename.endswith('.txt'):
                             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                 text = f.read()
-                            total_pages += 1  # Count text files as single pages
                             chunks = [t.strip() for t in text.split('\n\n') if t.strip()]
                             for j, chunk in enumerate(chunks):
                                 if len(chunk) > 50:
@@ -832,8 +889,7 @@ def upload_documents():
                 "custom_instructions": dataset_custom_instructions,
                 "created_at": current_time,
                 "last_update_date": current_time,
-                "document_count": total_documents,
-                "page_count": total_pages
+                "document_count": total_documents
             }
             save_dataset_metadata(dataset_metadata)
             
@@ -1023,7 +1079,8 @@ def delete_chat(chat_id):
 
 @app.route('/api/chats/<chat_id>/messages', methods=['POST'])
 def add_message(chat_id):
-    print(f"[CHAT_API] add_message called for chat_id: {chat_id}")
+    """Add a message to a chat and stream the response."""
+    # Capture request data before streaming
     data = request.json
     print(f"[CHAT_API] Request data: {data}")
     user_message = data.get('message', '')
@@ -1058,6 +1115,9 @@ def add_message(chat_id):
     chat_storage.add_message(chat_id, "user", user_message)
     print("[CHAT_API] User message added to storage.")
     
+    # Add initial assistant message for streaming
+    chat_storage.add_message(chat_id, "assistant", "Generating response...", {"streaming": True})
+    
     # Extract chat history for context
     history = []
     
@@ -1066,18 +1126,32 @@ def add_message(chat_id):
         if msg['role'] in ['user', 'assistant']:
             history.append({"role": msg['role'], "content": msg['content']})
     
-    # Retrieve context from Chroma based on user query
-    collection = chroma_client.get_or_create_collection(name=dataset_name)
-    results = collection.query(
-        query_texts=[user_message],
-        n_results=5
+    # Import the document processor for advanced querying
+    from app.utils.document_processor import LegalDocumentProcessor
+    
+    # Initialize document processor with the same settings as configured globally
+    doc_processor = LegalDocumentProcessor(
+        embedding_model=EMBEDDING_MODEL,
+        chroma_path=CHROMA_DIR,
+        device=device
     )
     
-    # Extract and format context
+    # Use advanced query with hybrid search and reranking
+    results = doc_processor.query_dataset(
+        dataset_name=dataset_name,
+        query=user_message,
+        n_results=5,
+        use_hybrid_search=True,
+        use_reranking=True
+    )
+    
+    # Format the context from retrieved documents
     context = ""
     if results and results['documents']:
-        for doc in results['documents'][0]:
-            context += f"{doc}\n\n"
+        for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
+            source = meta.get("source", "Unknown")
+            page = meta.get("page", meta.get("part", 0))
+            context += f"Source: {source} (Page {page})\n{doc}\n\n"
     
     # Create enhanced prompt for LLM with Chain of Thought reasoning
     if custom_instructions_for_dataset:
@@ -1085,96 +1159,80 @@ def add_message(chat_id):
         system_message = custom_instructions_for_dataset
         print(f"[CHAT_API] Using ONLY custom instructions as system prompt for dataset {dataset_name}")
     else:
-        # Default system message if no custom instructions for the dataset
-        system_message = """You are a legal expert.
-
-# Instructions
-- Use the provided context to analyze the user's question thoroughly
-- Implement chain-of-thought reasoning by breaking down your analysis step by step
-- First carefully examine the relevant sections from the provided context
-- Think about what legal principles apply to this situation
-- Consider multiple perspectives and interpretations if applicable
-- Draw connections between different parts of the context
-- Formulate a comprehensive and legally sound analysis
-- Cite specific articles, sections, or provisions when possible
-- Clearly separate your reasoning process from your final conclusion
-- If you don't know the answer or it's not in the context, state this clearly
-
-# Output Format
-Structure your response with these sections:
-1. SOURCES: A brief bulleted list of the most relevant source documents you're drawing from
-2. ANALYSIS: Your step-by-step reasoning about the question (this should be detailed)
-3. APPLICABLE PROVISIONS: Specific articles, sections, or legal provisions that apply
-4. CONCLUSION: Your final answer based on the analysis"""
-        print(f"[CHAT_API] Using default system instructions for dataset {dataset_name}")
-    
-    # Add context as a separate message
-    history.append({
-        "role": "system",
-        "content": f"# Context\n{context}"
-    })
-    
-    print(f"[CHAT_API] FINAL System Prompt for LLM:\n------\n{system_message}\n------")
-
-    # Initialize variables for response tracking
-    full_response = ""
-    
-    # Prepare messages for the LLM
-    messages = []
-    
-    # Add system message first
-    messages.append({
-        "role": "system",
-        "content": system_message
-    })
-    
-    # Add chat history (excluding system messages)
-    for msg in history:
-        if msg['role'] != 'system':  # Skip system messages as we already added it
-            messages.append(msg)
-    
-    # Add user message
-    messages.append({
-        "role": "user",
-        "content": user_message
-    })
-    
-    # Stream the LLM response
-    for chunk in llm_client.stream_with_rag(
-        query=user_message,
-        context=system_message,
-        chat_history=messages,  # Use the prepared messages list
-        temperature=0.1
-    ):
-        print(f"[CHAT_API] In generate(): Received chunk: {chunk[:50]}...")
-        full_response += chunk
-        yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+        # Use default system message with context
+        system_message = f"""You are a legal expert.
         
-        if len(full_response) - saved_response_length > 200:
-            update_streaming_message(full_response)
-            saved_response_length = len(full_response)
-            print(f"[CHAT_API] In generate(): Updated streaming message, now at {saved_response_length} chars")
+        # Instructions
+        - Use the provided context to analyze the user's question thoroughly
+        - Implement chain-of-thought reasoning by breaking down your analysis step by step
+        - First carefully examine the relevant sections from the provided context
+        - Think about what legal principles apply to this situation
+        - Consider multiple perspectives and interpretations if applicable
+        - Draw connections between different parts of the context
+        - Formulate a comprehensive and legally sound analysis
+        - Cite specific articles, sections, or provisions when possible
+        - Clearly separate your reasoning process from your final conclusion
+        - If you don't know the answer or it's not in the context, state this clearly
+        
+        # Output Format
+        Structure your response with these sections:
+        1. SOURCES: A brief bulleted list of the most relevant source documents you're drawing from
+        2. ANALYSIS: Your step-by-step reasoning about the question (this should be detailed)
+        3. APPLICABLE PROVISIONS: Specific articles, sections, or legal provisions that apply
+        4. CONCLUSION: Your final answer based on the analysis
+        
+        # Context
+        {context}
+        """
     
-    print("[CHAT_API] In generate(): Finished iterating llm_client.stream_with_rag")
-    # Yield a completion event 
-    yield f"data: {json.dumps({'done': True})}\n\n"
-    
-    # Make sure to save the final complete response
-    finalize_message(full_response)
-    
-    # The @after_this_request handler was unreliable for saving messages
-    # We now save during streaming instead
+    def generate():
+        nonlocal full_response, saved_response_length
+        
+        # Prepare messages for the LLM
+        messages = []
+        
+        # Add system message first
+        messages.append({
+            "role": "system",
+            "content": system_message
+        })
+        
+        # Add chat history (excluding system messages)
+        for msg in history:
+            if msg['role'] != 'system':  # Skip system messages as we already added it
+                messages.append(msg)
+        
+        # Add user message
+        messages.append({
+            "role": "user",
+            "content": user_message
+        })
+        
+        # Stream the LLM response
+        for chunk in llm_client.stream_with_rag(
+            query=user_message,
+            context=context,  # Pass the actual context here
+            chat_history=messages,
+            temperature=0.1
+        ):
+            print(f"[CHAT_API] In generate(): Received chunk: {chunk[:50]}...")
+            full_response += chunk
+            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+            
+            if len(full_response) - saved_response_length > 200:
+                update_streaming_message(chat_id, full_response)
+                saved_response_length = len(full_response)
+                print(f"[CHAT_API] In generate(): Updated streaming message, now at {saved_response_length} chars")
+        
+        print("[CHAT_API] In generate(): Finished iterating llm_client.stream_with_rag")
+        # Yield a completion event 
+        yield f"data: {json.dumps({'done': True})}\n\n"
+        
+        # Make sure to save the final complete response
+        finalize_message(chat_id, full_response)
     
     print("[CHAT_API] Returning streaming response object.")
-    # Return streaming response
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"  # Disable Nginx buffering
-        }
-    )
+    return Response(stream_with_context(generate()), mimetype='text/event-stream')
 
 @app.route('/api/save-last-chat', methods=['POST'])
 def save_last_chat():
@@ -1841,88 +1899,129 @@ def list_dataset_documents(dataset_name):
 @app.route('/api/datasets/<dataset_name>/documents', methods=['POST'])
 def upload_documents_to_dataset(dataset_name):
     """Upload documents to an existing dataset (append to Chroma collection)."""
-    try:
-        if 'files' not in request.files:
-            return jsonify({"status": "error", "message": "No files uploaded"}), 400
-        # Save uploaded files
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], timestamp)
-        os.makedirs(upload_path, exist_ok=True)
-        uploaded_files = request.files.getlist('files')
-        saved_files = []
-        for file in uploaded_files:
-            if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                file_path = os.path.join(upload_path, filename)
-                file.save(file_path)
-                saved_files.append(filename)
-        if not saved_files:
-            return jsonify({"status": "error", "message": "No valid files uploaded"}), 400
-        # Get collection
-        collection = chroma_client.get_or_create_collection(name=dataset_name)
-        # Process and add to Chroma
-        documents = []
-        metadatas = []
-        ids = []
-        total_pages = 0
-        total_documents = len(saved_files)
-        
-        # First, get existing metadata to preserve counts
-        dataset_metadata = load_dataset_metadata()
-        current_metadata = dataset_metadata.get(dataset_name, {})
-        existing_doc_count = current_metadata.get("document_count", 0)
-        existing_page_count = current_metadata.get("page_count", 0)
-        
-        for i, doc_file in enumerate(saved_files):
-            file_path = os.path.join(upload_path, doc_file)
-            try:
-                if doc_file.endswith('.pdf'):
-                    extracted_texts = robust_extract_text_from_pdf(file_path)
-                    total_pages += len(extracted_texts)
-                    for j, text in enumerate(extracted_texts):
-                        if text and len(text) > 50:
-                            documents.append(text)
-                            metadatas.append({"source": doc_file, "page": j + 1})
-                            ids.append(f"{doc_file}_{i}_{j}")
-                elif doc_file.endswith('.txt'):
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        text = f.read()
-                    total_pages += 1  # Count text files as single pages
-                    chunks = [t.strip() for t in text.split('\n\n') if t.strip()]
-                    for j, chunk in enumerate(chunks):
-                        if len(chunk) > 50:
-                            documents.append(chunk)
-                            metadatas.append({"source": doc_file, "page": 1})
-                            ids.append(f"{doc_file}_{i}_{j}")
-            except Exception as e:
-                print(f"Error processing {file_path}: {str(e)}")
-        
-        # Add to Chroma in batches
-        for i in range(0, len(documents), 100):
-            batch_docs = documents[i:i+100]
-            batch_meta = metadatas[i:i+100]
-            batch_ids = ids[i:i+100]
-            collection.add(documents=batch_docs, metadatas=batch_meta, ids=batch_ids)
-        
-        # Update dataset metadata with new counts
-        if dataset_name in dataset_metadata:
-            # Update document count by adding new documents to existing count
-            current_metadata["document_count"] = existing_doc_count + total_documents
-            # Update page count by adding new pages to existing count
-            current_metadata["page_count"] = existing_page_count + total_pages
-            current_metadata["last_update_date"] = datetime.now().isoformat()
-            dataset_metadata[dataset_name] = current_metadata
-            save_dataset_metadata(dataset_metadata)
-        
-        return jsonify({
-            "success": True, 
-            "message": f"Uploaded {total_documents} documents ({total_pages} pages) to {dataset_name}",
-            "total_documents": existing_doc_count + total_documents,
-            "total_pages": existing_page_count + total_pages
-        })
-    except Exception as e:
-        print(f"Error uploading documents to dataset {dataset_name}: {e}")
-        return jsonify({"status": "error", "message": f"Server error: {str(e)}"}), 500
+    def generate_progress():
+        try:
+            if 'files' not in request.files:
+                yield json.dumps({"status": "error", "message": "No files uploaded"}) + "\n"
+                return
+
+            # Save uploaded files
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            upload_path = os.path.join(app.config['UPLOAD_FOLDER'], timestamp)
+            os.makedirs(upload_path, exist_ok=True)
+            uploaded_files = request.files.getlist('files')
+            saved_files = []
+            
+            # Initial progress update
+            yield json.dumps({"progress": 0.0, "status": "Starting upload..."}) + "\n"
+            time.sleep(0.5)  # Simulate processing delay
+            
+            for file in uploaded_files:
+                if file and allowed_file(file.filename):
+                    filename = secure_filename(file.filename)
+                    file_path = os.path.join(upload_path, filename)
+                    file.save(file_path)
+                    saved_files.append(filename)
+            
+            if not saved_files:
+                yield json.dumps({"status": "error", "message": "No valid files uploaded"}) + "\n"
+                return
+
+            # Get collection
+            collection = chroma_client.get_or_create_collection(name=dataset_name)
+            
+            # Process and add to Chroma
+            documents = []
+            metadatas = []
+            ids = []
+            total_documents = len(saved_files)  # This is the number of actual files uploaded
+            
+            # Get existing metadata
+            dataset_metadata = load_dataset_metadata()
+            current_metadata = dataset_metadata.get(dataset_name, {})
+            existing_doc_count = current_metadata.get("document_count", 0)
+            
+            # Update progress for file processing
+            yield json.dumps({"progress": 0.2, "status": "Processing files..."}) + "\n"
+            time.sleep(0.5)  # Simulate processing delay
+            
+            # Keep track of unique documents
+            unique_documents = set()
+            
+            for i, doc_file in enumerate(saved_files):
+                file_path = os.path.join(upload_path, doc_file)
+                try:
+                    if doc_file.endswith('.pdf'):
+                        extracted_texts = robust_extract_text_from_pdf(file_path)
+                        for j, text in enumerate(extracted_texts):
+                            if text and len(text) > 50:
+                                documents.append(text)
+                                metadatas.append({"source": doc_file, "page": j + 1})
+                                ids.append(f"{doc_file}_{i}_{j}")
+                                unique_documents.add(doc_file)  # Add to unique documents set
+                    elif doc_file.endswith('.txt'):
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            text = f.read()
+                        chunks = [t.strip() for t in text.split('\n\n') if t.strip()]
+                        for j, chunk in enumerate(chunks):
+                            if len(chunk) > 50:
+                                documents.append(chunk)
+                                metadatas.append({"source": doc_file, "page": 1})
+                                ids.append(f"{doc_file}_{i}_{j}")
+                                unique_documents.add(doc_file)  # Add to unique documents set
+                except Exception as e:
+                    print(f"Error processing {file_path}: {str(e)}")
+                
+                # Update progress during file processing
+                progress = 0.2 + (0.4 * (i + 1) / total_documents)
+                yield json.dumps({"progress": progress, "status": f"Processing file {i+1} of {total_documents}..."}) + "\n"
+                time.sleep(0.5)  # Simulate processing delay
+            
+            # Update progress for Chroma processing
+            yield json.dumps({"progress": 0.6, "status": "Adding to database..."}) + "\n"
+            time.sleep(0.5)  # Simulate processing delay
+            
+            # Add to Chroma in batches
+            total_batches = (len(documents) + 99) // 100
+            for i in range(0, len(documents), 100):
+                batch_docs = documents[i:i+100]
+                batch_meta = metadatas[i:i+100]
+                batch_ids = ids[i:i+100]
+                collection.add(documents=batch_docs, metadatas=batch_meta, ids=batch_ids)
+                
+                # Update progress during batch processing
+                batch_progress = 0.6 + (0.3 * (i // 100 + 1) / total_batches)
+                yield json.dumps({"progress": batch_progress, "status": f"Processing batch {i//100 + 1} of {total_batches}..."}) + "\n"
+                time.sleep(0.5)  # Simulate processing delay
+            
+            # Update dataset metadata with the correct document count
+            if dataset_name in dataset_metadata:
+                # Get current unique documents from collection
+                results = collection.get(include=["metadatas"])
+                current_unique_sources = set()
+                for meta in results["metadatas"]:
+                    source = meta.get("source")
+                    if source:
+                        current_unique_sources.add(source)
+                
+                # Add new unique documents
+                for doc_file in saved_files:
+                    current_unique_sources.add(doc_file)
+                
+                # Update metadata with total unique documents
+                current_metadata["document_count"] = len(current_unique_sources)
+                current_metadata["last_update_date"] = datetime.now().isoformat()
+                dataset_metadata[dataset_name] = current_metadata
+                save_dataset_metadata(dataset_metadata)
+            
+            # Final progress update with success message
+            yield json.dumps({"progress": 1.0, "status": "Upload complete!", "success": True}) + "\n"
+            
+        except Exception as e:
+            print(f"Error uploading documents to dataset {dataset_name}: {e}")
+            yield json.dumps({"status": "error", "message": f"Server error: {str(e)}"}) + "\n"
+    
+    return Response(stream_with_context(generate_progress()), mimetype='application/x-ndjson')
 
 @app.route('/api/datasets/<dataset_name>/documents/<doc_id>', methods=['DELETE'])
 def delete_document_from_dataset(dataset_name, doc_id):
@@ -1934,7 +2033,28 @@ def delete_document_from_dataset(dataset_name, doc_id):
         ids_to_delete = [id_ for meta, id_ in zip(results["metadatas"], results["ids"]) if meta.get("source") == doc_id or meta.get("file") == doc_id or meta.get("filename") == doc_id]
         if not ids_to_delete:
             return jsonify({"success": False, "message": "No chunks found for this document."}), 404
+        
+        # Delete the chunks
         collection.delete(ids=ids_to_delete)
+        
+        # Update dataset metadata with new document count
+        dataset_metadata = load_dataset_metadata()
+        if dataset_name in dataset_metadata:
+            # Get current unique documents from collection after deletion
+            results = collection.get(include=["metadatas"])
+            current_unique_sources = set()
+            for meta in results["metadatas"]:
+                source = meta.get("source")
+                if source:
+                    current_unique_sources.add(source)
+            
+            # Update metadata with new document count
+            current_metadata = dataset_metadata[dataset_name]
+            current_metadata["document_count"] = len(current_unique_sources)
+            current_metadata["last_update_date"] = datetime.now().isoformat()
+            dataset_metadata[dataset_name] = current_metadata
+            save_dataset_metadata(dataset_metadata)
+        
         return jsonify({"success": True, "message": f"Deleted document {doc_id} and its chunks."})
     except Exception as e:
         print(f"Error deleting document {doc_id} from dataset {dataset_name}: {e}")
@@ -1955,7 +2075,45 @@ def check_dataset_name():
 # Add an alias for the update endpoint to support /update
 @app.route('/api/datasets/<dataset_name>/update', methods=['PUT'])
 def update_dataset_metadata_route_alias(dataset_name):
+    print(f"[DEBUG] Alias route hit for dataset_name: '{dataset_name}'")
     return update_dataset_metadata_route(dataset_name)
+
+# Add these functions before the add_message route
+def update_streaming_message(chat_id: str, content: str) -> None:
+    """Update a streaming message in the chat storage."""
+    try:
+        chat = chat_storage.get_chat(chat_id)
+        if chat and chat.get('messages'):
+            # Find the last message (which should be the streaming one)
+            last_message = chat['messages'][-1]
+            if last_message['role'] == 'assistant':
+                last_message['content'] = content
+                last_message['metadata'] = last_message.get('metadata', {})
+                last_message['metadata']['streaming'] = True
+                # Save the updated chat
+                chat_file = os.path.join(chat_storage.storage_dir, f"{chat_id}.json")
+                with open(chat_file, 'w') as f:
+                    json.dump(chat, f, indent=2)
+    except Exception as e:
+        print(f"Error updating streaming message: {str(e)}")
+
+def finalize_message(chat_id: str, content: str) -> None:
+    """Finalize a streaming message in the chat storage."""
+    try:
+        chat = chat_storage.get_chat(chat_id)
+        if chat and chat.get('messages'):
+            # Find the last message (which should be the streaming one)
+            last_message = chat['messages'][-1]
+            if last_message['role'] == 'assistant':
+                last_message['content'] = content
+                last_message['metadata'] = last_message.get('metadata', {})
+                last_message['metadata']['streaming'] = False
+                # Save the updated chat
+                chat_file = os.path.join(chat_storage.storage_dir, f"{chat_id}.json")
+                with open(chat_file, 'w') as f:
+                    json.dump(chat, f, indent=2)
+    except Exception as e:
+        print(f"Error finalizing message: {str(e)}")
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

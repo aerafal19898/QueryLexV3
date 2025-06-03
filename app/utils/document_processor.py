@@ -11,6 +11,7 @@ from unstructured.cleaners.core import clean_extra_whitespace
 import chromadb
 import torch
 from tqdm import tqdm
+from app.main import HNSW_CONFIG  # Import the HNSW configuration
 
 class LegalDocumentProcessor:
     """Processor for legal documents with specialized handling for legal terminology."""
@@ -35,13 +36,13 @@ class LegalDocumentProcessor:
         )
         self.chroma_client = chromadb.PersistentClient(path=chroma_path)
     
-    def process_document(self, file_path: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> List[str]:
+    def process_document(self, file_path: str, chunk_size: int = 2000, chunk_overlap: int = 400) -> List[str]:
         """Process a single document and return chunked text.
         
         Args:
             file_path: Path to the document
-            chunk_size: Size of text chunks
-            chunk_overlap: Overlap between chunks
+            chunk_size: Size of text chunks (increased from 1000 to 2000)
+            chunk_overlap: Overlap between chunks (increased from 200 to 400)
             
         Returns:
             List of text chunks
@@ -355,7 +356,10 @@ class LegalDocumentProcessor:
         import glob
         
         # Create or get collection
-        collection = self.chroma_client.get_or_create_collection(name=ragmodel_name)
+        collection = self.chroma_client.get_or_create_collection(
+            name=ragmodel_name,
+            hnsw_config=HNSW_CONFIG
+        )
         
         # Get list of PDF files
         file_paths = glob.glob(os.path.join(documents_dir, file_filter))
@@ -607,12 +611,17 @@ class LegalDocumentProcessor:
             
         return results
 
-    def query_dataset(self, dataset_name, query, n_results=5, use_hybrid_search=True, use_reranking=True):
+    def query_dataset(self, dataset_name, query, n_results=5, use_hybrid_search=True, use_reranking=True, where=None):
         """Query the Chroma collection for relevant documents and metadatas."""
         collection = self.chroma_client.get_or_create_collection(name=dataset_name)
-        results = collection.query(
-            query_texts=[query],
+        
+        # Use the advanced query_ragmodel function which has hybrid search and reranking
+        results = self.query_ragmodel(
+            ragmodel_name=dataset_name,
+            query=query,
             n_results=n_results,
-            include=["documents", "metadatas"]
+            use_hybrid_search=use_hybrid_search,
+            use_reranking=use_reranking
         )
+        
         return results

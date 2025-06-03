@@ -189,9 +189,20 @@ class OpenRouterClient:
                     
                     try:
                         data = json.loads(json_data)
-                        chunk = data["choices"][0]["delta"].get("content", "")
+                        # Handle both standard and OpenRouter-specific response formats
+                        if "choices" in data:
+                            chunk = data["choices"][0]["delta"].get("content", "")
+                        elif "text" in data:
+                            chunk = data["text"]
+                        else:
+                            print(f"Unexpected response format: {data}")
+                            continue
+                            
                         if chunk:
                             yield chunk
                     except json.JSONDecodeError:
                         print(f"Error parsing JSON: {json_data}")
+                        continue
+                    except Exception as e:
+                        print(f"Error processing chunk: {str(e)}")
                         continue

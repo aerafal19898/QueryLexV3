@@ -165,3 +165,12 @@ tasks.md
 *.backup
 *~
 *.old
+
+# Model files and caches
+.cache/
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
