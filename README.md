@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # QueryLex V4 – Secure Legal‑RAG Marketplace ⚖️🤖
 
 A secure, EU-hosted marketplace where legal professionals can buy, sell, and chat with Retrieval‑Augmented‑Generation (RAG) models. Built with enterprise-grade security and compliance in mind.
@@ -142,3 +143,6 @@ We welcome contributions! Please read our contributing guidelines before submitt
 ## 📄 License
 
 MIT License - See LICENSE file for details
+=======
+# QueryLexV3
+>>>>>>> c3a5449df3f0bd5a91f1e99b91881a95a2fc3263
