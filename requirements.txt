@@ -14,7 +14,6 @@ waitress==2.1.2
 # Security
 bcrypt==4.1.2
 cryptography==44.0.1
-pyjwt==2.8.0
 
 # Document Processing
 # Note: Poppler is required for PDF processing. Install via:
@@ -28,19 +27,23 @@ pdf2image==1.16.3
 pytesseract==0.3.10
 
 # Vector Database
-chromadb==0.4.18
+supabase==2.8.1
+# Supabase dependencies will be auto-resolved by pip
 
 # ML & Embeddings
 torch==2.2.0
 transformers==4.35.2
-sentence-transformers==2.2.2
+sentence-transformers==2.7.0
 huggingface-hub==0.19.4
+langchain-community==0.0.19
 
 # Utilities
 pillow==10.2.0
 tqdm==4.66.1
 nltk==3.8.1
 requests==2.31.0
+numpy==1.24.3
+anyio<4.0
 
 # Production Server
 gunicorn==21.2.0

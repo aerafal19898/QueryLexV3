@@ -8,11 +8,14 @@ import json
 import shutil
 import tempfile
 import logging
+import time
+import secrets
 from typing import List, Dict, Any, Optional, BinaryIO, Union
 from pathlib import Path
 
 from app.utils.encryption import DocumentEncryption, SecureTemporaryAccess
 from app.utils.document_processor import LegalDocumentProcessor
+from app.utils.supabase_client import SupabaseCollection
 
 class SecureDocumentProcessor:
     """Process documents securely in memory with encryption."""
@@ -21,7 +24,6 @@ class SecureDocumentProcessor:
         self,
         encryption_handler: Optional[DocumentEncryption] = None,
         embedding_model: str = "BAAI/bge-large-en-v1.5",
-        chroma_path: Optional[str] = None,
         device: str = "cpu"
     ):
         """Initialize the secure document processor.
@@ -29,7 +31,6 @@ class SecureDocumentProcessor:
         Args:
             encryption_handler: Optional encryption handler
             embedding_model: Name of the embedding model
-            chroma_path: Path to ChromaDB
             device: Device to use for embeddings
         """
         # Set up encryption handler
@@ -41,15 +42,10 @@ class SecureDocumentProcessor:
         # Initialize secure temporary access
         self.temp_access = SecureTemporaryAccess(self.encryption)
         
-        # Set up base directory and ChromaDB path
-        base_dir = Path(__file__).resolve().parent.parent.parent
-        if chroma_path is None:
-            chroma_path = os.path.join(base_dir, "data", "chroma")
         
         # Initialize document processor with provided settings
         self.doc_processor = LegalDocumentProcessor(
             embedding_model=embedding_model,
-            chroma_path=chroma_path,
             device=device
         )
         
@@ -232,8 +228,12 @@ class SecureDocumentProcessor:
             metadatas.append(chunk_metadata)
             ids.append(chunk_id)
         
-        # Get ChromaDB collection
-        collection = self.doc_processor.chroma_client.get_or_create_collection(name=ragmodel_name)
+        # Get Supabase collection
+        if self.doc_processor.use_supabase and self.doc_processor.supabase_client:
+            collection_data = self.doc_processor.supabase_client.get_or_create_collection(ragmodel_name)
+            collection = SupabaseCollection(self.doc_processor.supabase_client, ragmodel_name, collection_data)
+        else:
+            raise Exception("Supabase client not available for secure processing")
         
         # Add chunks in batches
         batch_size = 100

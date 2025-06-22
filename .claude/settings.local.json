@@ -1,7 +1,33 @@
 {
   "permissions": {
     "allow": [
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(rg:*)",
+      "Bash(python:*)",
+      "Bash(rm:*)",
+      "Bash(find:*)",
+      "Bash(awk:*)",
+      "Bash(sed:*)",
+      "Bash(source:*)",
+      "Bash(./venv/Scripts/python.exe test_supabase_metadata.py:*)",
+      "Bash(venv/Scripts/python.exe:*)",
+      "Bash(./venv/Scripts/python:*)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"upload.*documents\" app/main.py)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"class SupabaseCollection\" app/utils/supabase_client.py)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -A 5 -B 5 \"Upload did not complete successfully\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -B 20 \"uploadComplete\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"document_count|documents:\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -B5 -A5 \"Documents:\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"document_count\" app/main.py)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"delete.*dataset\" app/main.py)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -A 10 \"deleteDataset|async function.*delete\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -A 30 \"async function deleteDataset\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -A 20 -B 5 \"currentDataset === datasetName\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"DEFAULT_DATASETS\" app/templates/index.html)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"select.*dataset|dataset.*select\" app/templates/index.html -i)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"function viewDatasets\" app/templates/index.html -A 50)",
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -B 5 -A 15 \"datasetCard.addEventListener.*click\" app/templates/index.html)"
     ],
     "deny": []
   }

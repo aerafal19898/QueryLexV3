@@ -7,10 +7,8 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, verify_jwt_in_request, decode_token
 from functools import wraps
 import os
-import chromadb
-from chromadb.config import Settings
+from app.utils.supabase_client import SupabaseVectorClient, SupabaseCollection
 import uuid
-import werkzeug
 import time
 import re
 import json
@@ -20,14 +18,11 @@ from transformers import pipeline
 import torch
 from unstructured.partition.pdf import partition_pdf
 import dotenv
-import shutil
 from datetime import datetime
 import nltk
-from app.models.chat import ChatStorage
 import PyPDF2
 import io
 import tempfile
-from PIL import Image
 import secrets
 try:
     import pytesseract
@@ -50,11 +45,8 @@ except Exception as e:
 
 # Local imports
 from app.config import (
-    CHROMA_DIR, 
     DOCUMENTS_DIR, 
     EMBEDDING_MODEL,
-    DEEPSEEK_API_KEY, 
-    DEEPSEEK_API_BASE,
     OPENROUTER_API_KEY,
     OPENROUTER_API_BASE,
     MODEL_PROVIDER,
@@ -62,10 +54,13 @@ from app.config import (
     SECRET_KEY,
     DEFAULT_DATASETS,
     ROLE_PERMISSIONS,
-    AVAILABLE_MODELS
+    AVAILABLE_MODELS,
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    SUPABASE_SERVICE_KEY
 )
-from app.utils.deepseek_client import DeepSeekClient
 from app.utils.openrouter_client import OpenRouterClient
+from app.utils.chat_service import SupabaseChatService
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -73,18 +68,26 @@ app.secret_key = SECRET_KEY
 app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 24 * 31  # 31 days in seconds
 CORS(app)
 
-# Initialize Chroma
-chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
+# Initialize Supabase Vector Client
+try:
+    supabase_client = SupabaseVectorClient(use_service_key=True)
+    print("Successfully connected to Supabase")
+except Exception as e:
+    print(f"Warning: Could not connect to Supabase: {e}")
+    print("Falling back to local mode")
+    supabase_client = None
 
-# Set HNSW parameters for better performance with larger datasets
-HNSW_CONFIG = {
-    "M": 128,  # Maximum number of connections per element
-    "ef_construction": 400,  # Size of the dynamic candidate list during construction
-    "ef_search": 200  # Size of the dynamic candidate list during search
-}
+
+# Configure SSL for HuggingFace embeddings
+import ssl
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
 
 # Initialize embeddings
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+# Direct use of Supabase client - no wrapper functions needed
 
 # Initialize the OpenRouter client with the new DeepSeek model
 print(f"Using OpenRouter with model: deepseek/deepseek-chat-v3-0324:free")
@@ -106,7 +109,7 @@ app.config['JWT_REFRESH_TOKEN_EXPIRES'] = int(os.environ.get("JWT_REFRESH_TOKEN_
 # Import and initialize additional components
 from app.models.user import User
 from app.utils.audit_logger import AuditLogger
-from app.utils.feedback import FeedbackManager
+from app.utils.feedback_service import SupabaseFeedbackService
 from app.utils.credit_system import CreditSystem
 from app.utils.encryption import DocumentEncryption
 from app.utils.secure_processor import SecureDocumentProcessor
@@ -121,8 +124,8 @@ from app.config import MAIL_DEFAULT_SENDER, MAIL_FEEDBACK_RECIPIENT, MAIL_USE_TL
 # Create audit logger
 audit_logger = AuditLogger(enabled=os.environ.get("ENABLE_AUDIT_LOGGING", "True").lower() == "true")
 
-# Initialize feedback manager
-feedback_manager = FeedbackManager(
+# Initialize feedback service
+feedback_manager = SupabaseFeedbackService(
     smtp_server=os.environ.get("MAIL_SERVER", MAIL_SERVER),
     smtp_port=int(os.environ.get("MAIL_PORT", MAIL_PORT)),
     smtp_username=os.environ.get("MAIL_USERNAME", MAIL_USERNAME),
@@ -147,33 +150,50 @@ document_encryption = DocumentEncryption(key=os.environ.get("DOCUMENT_ENCRYPTION
 secure_processor = SecureDocumentProcessor(
     encryption_handler=document_encryption,
     embedding_model=EMBEDDING_MODEL,
-    chroma_path=CHROMA_DIR,
     device=device
 )
 
 # Initialize chat storage
-chat_storage = ChatStorage()
+try:
+    chat_storage = SupabaseChatService(use_service_key=True)
+    print("Successfully connected to Supabase for chat storage")
+except Exception as e:
+    print(f"Warning: Could not connect to Supabase for chat storage: {e}")
+    chat_storage = None
+
+# Initialize default dataset on app start
+DEFAULT_DATASET_NAME = None
+
+def initialize_default_dataset():
+    """Initialize default dataset from the first available dataset in Supabase."""
+    global DEFAULT_DATASET_NAME
+    try:
+        if supabase_client:
+            collections = supabase_client.list_collections()
+            collections = [{"name": c["name"]} for c in collections]
+            if collections:
+                # Set the first available dataset as default
+                DEFAULT_DATASET_NAME = collections[0]["name"]
+                print(f"Default dataset set to: {DEFAULT_DATASET_NAME}")
+            else:
+                print("No datasets available - users will see 'No datasets available' message")
+                DEFAULT_DATASET_NAME = None
+        else:
+            print("Supabase client not available - cannot set default dataset")
+            DEFAULT_DATASET_NAME = None
+    except Exception as e:
+        print(f"Error initializing default dataset: {e}")
+        DEFAULT_DATASET_NAME = None
+
+# Initialize default dataset
+initialize_default_dataset()
 
 # Define base directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATASET_METADATA_FILE = os.path.join(BASE_DIR, "data", "dataset_metadata.json")
 
-# Helper functions for dataset metadata
-def load_dataset_metadata():
-    if not os.path.exists(DATASET_METADATA_FILE):
-        return {}
-    try:
-        with open(DATASET_METADATA_FILE, 'r') as f:
-            return json.load(f)
-    except (IOError, json.JSONDecodeError):
-        return {}
-
-def save_dataset_metadata(metadata):
-    try:
-        with open(DATASET_METADATA_FILE, 'w') as f:
-            json.dump(metadata, f, indent=2)
-    except IOError:
-        print(f"Error: Could not save dataset metadata to {DATASET_METADATA_FILE}")
+# Dataset metadata is now stored in Supabase collections
+# The load_dataset_metadata and save_dataset_metadata functions have been removed
+# as all metadata operations now use supabase_client.update_collection_metadata()
 
 # Configure file uploads
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "data", "uploads")
@@ -190,6 +210,34 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 def allowed_file(filename):
     """Check if the file has an allowed extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def format_response_with_bold_headers(response):
+    """Ensure section headers are bolded in the response."""
+    if not isinstance(response, str):
+        return response
+    
+    # Apply bold formatting to common section headers
+    formatted_response = response
+    
+    # Main section headers
+    formatted_response = formatted_response.replace('SOURCES:', '**SOURCES:**')
+    formatted_response = formatted_response.replace('ANALYSIS:', '**ANALYSIS:**')
+    formatted_response = formatted_response.replace('APPLICABLE PROVISIONS:', '**APPLICABLE PROVISIONS:**')
+    formatted_response = formatted_response.replace('CONCLUSION:', '**CONCLUSION:**')
+    
+    # Alternative formats
+    formatted_response = formatted_response.replace('Sources:', '**Sources:**')
+    formatted_response = formatted_response.replace('Analysis:', '**Analysis:**')
+    formatted_response = formatted_response.replace('Applicable Provisions:', '**Applicable Provisions:**')
+    formatted_response = formatted_response.replace('Conclusion:', '**Conclusion:**')
+    
+    # Numbered sections
+    formatted_response = formatted_response.replace('1. SOURCES:', '1. **SOURCES:**')
+    formatted_response = formatted_response.replace('2. ANALYSIS:', '2. **ANALYSIS:**')
+    formatted_response = formatted_response.replace('3. APPLICABLE PROVISIONS:', '3. **APPLICABLE PROVISIONS:**')
+    formatted_response = formatted_response.replace('4. CONCLUSION:', '4. **CONCLUSION:**')
+    
+    return formatted_response
 
 def robust_extract_text_from_pdf(pdf_path):
     """Extract text from PDF using multiple methods for better reliability."""
@@ -281,8 +329,20 @@ def index():
     # Optionally, you can track last_active_chat here if you want to reopen the last chat automatically
     last_active_chat = session.get('last_active_chat', None)
     
+    # Get available datasets for the UI
+    try:
+        collections = supabase_client.list_collections()
+        available_datasets = [{"name": c["name"], "description": f"Dataset: {c['name']}"} for c in collections]
+        # If no datasets available, add a placeholder
+        if not available_datasets:
+            available_datasets = [{"name": "", "description": "No datasets available"}]
+    except Exception as e:
+        print(f"Error loading datasets for UI: {e}")
+        available_datasets = [{"name": "", "description": "No datasets available"}]
+    
     return render_template('index.html', 
-                          datasets=DEFAULT_DATASETS,
+                          datasets=available_datasets,
+                          default_dataset=DEFAULT_DATASET_NAME,
                           available_models=AVAILABLE_MODELS,
                           last_active_chat=last_active_chat)
 
@@ -291,47 +351,66 @@ def chat():
     """Process chat messages and return AI responses with relevant context."""
     data = request.json
     user_message = data.get('message', '')
-    dataset_name = data.get('dataset', 'EU-Sanctions')
+    dataset_name = data.get('dataset', DEFAULT_DATASET_NAME or 'EU-Sanctions')
     model_name = data.get('model', MODEL_NAME)  # Get the selected model
     history = data.get('history', [])
+    
+    # Validate that the dataset exists
+    if supabase_client:
+        try:
+            collections = supabase_client.list_collections()
+            available_datasets = [c["name"] for c in collections]
+            
+            if dataset_name not in available_datasets:
+                if available_datasets:
+                    dataset_name = available_datasets[0]
+                    print(f"[CHAT] Dataset not found, using first available: '{dataset_name}'")
+                else:
+                    dataset_name = None
+        except Exception as e:
+            print(f"[CHAT] Error validating dataset: {e}")
     
     # Get session ID for this conversation
     if 'session_id' not in session:
         session.permanent = True
         session['session_id'] = str(uuid.uuid4())
     
-    # Retrieve context from Chroma based on user query
-    collection = chroma_client.get_or_create_collection(name=dataset_name)
+    # Handle the case where no datasets are available
+    if not dataset_name:
+        return jsonify({
+            'response': "No datasets are currently available. Please upload documents to create a dataset first.",
+            'context': "No datasets available",
+            'dataset': "None",
+            'raw_context': "No datasets available"
+        })
     
-    # Get the document count to determine how many results we can request
-    doc_count = collection.count()
-    n_results = min(5, max(1, doc_count))  # Request at most 5, but at least 1 if available
+    # Retrieve context from Supabase based on user query
+    collection = supabase_client.get_or_create_collection(dataset_name)
     
-    # Handle the case of an empty collection
-    if doc_count == 0:
+    # Handle the case where collection is None or empty
+    if not collection:
         results = {
-            'documents': [["No documents found in the selected dataset. Please upload documents or select a different dataset."]],
+            'documents': [["Database connection error. Please check your Supabase configuration."]],
             'metadatas': [[{"source": "System", "page": 0}]]
         }
     else:
-        # Import the document processor for advanced querying
-        from app.utils.document_processor import LegalDocumentProcessor
+        # Get the document count to determine how many results we can request
+        doc_count = collection.count()
+        n_results = min(5, max(1, doc_count))  # Request at most 5, but at least 1 if available
         
-        # Initialize document processor with the same settings as configured globally
-        doc_processor = LegalDocumentProcessor(
-            embedding_model=EMBEDDING_MODEL,
-            chroma_path=CHROMA_DIR,
-            device=device
-        )
-        
-        # Use advanced query with hybrid search and reranking
-        results = doc_processor.query_dataset(
-            dataset_name=dataset_name,
-            query=user_message,
-            n_results=n_results,
-            use_hybrid_search=True,
-            use_reranking=True
-        )
+        # Handle the case of an empty collection
+        if doc_count == 0:
+            results = {
+                'documents': [["No documents found in the selected dataset. Please upload documents or select a different dataset."]],
+                'metadatas': [[{"source": "System", "page": 0}]]
+            }
+        else:
+            # Query the collection directly using embeddings
+            query_embedding = embeddings.embed_query(user_message)
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results
+            )
     
     context = '\n\n'.join(results['documents'][0])
     
@@ -360,11 +439,13 @@ def chat():
     - If you don't know the answer or it's not in the context, state this clearly
     
     # Output Format
-    Structure your response with these sections:
-    1. SOURCES: A brief bulleted list of the most relevant source documents you're drawing from
-    2. ANALYSIS: Your step-by-step reasoning about the question (this should be detailed)
-    3. APPLICABLE PROVISIONS: Specific articles, sections, or legal provisions that apply
-    4. CONCLUSION: Your final answer based on the analysis
+    Structure your response with these sections, using **bold** formatting for section titles:
+    1. **SOURCES**: A brief bulleted list of the most relevant source documents you're drawing from
+    2. **ANALYSIS**: Your step-by-step reasoning about the question (this should be detailed)
+    3. **APPLICABLE PROVISIONS**: Specific articles, sections, or legal provisions that apply
+    4. **CONCLUSION**: Your final answer based on the analysis
+    
+    Important: Always format section headers in bold using **TITLE**: format
     
     # Context
     {context}
@@ -391,6 +472,8 @@ def chat():
             chat_history=formatted_history[-10:] if formatted_history else [],  # Use last 5 turns (10 messages)
             temperature=0.1  # Lower temperature for more analytical responses
         )
+        # Ensure section headers are bolded in Markdown
+        response = format_response_with_bold_headers(response)
     except Exception as e:
         print(f"Error calling LLM API: {str(e)}")
         response = "I'm sorry, I encountered an error processing your request. Please try again later."
@@ -408,40 +491,63 @@ def chat():
 @app.route('/api/datasets', methods=['GET'])
 def get_datasets():
     """Return available datasets."""
-    # List collections in Chroma
+    # List collections in Supabase
     try:
-        collections = chroma_client.list_collections()
-        collection_names = [c.name for c in collections]
+        collections = supabase_client.list_collections()
         
         # Debug output
-        print(f"Found Chroma collections: {collection_names}")
+        print(f"Found Supabase collections: {[c['name'] for c in collections]}")
         
         # Combine with default datasets
         all_datasets = []
-        dataset_metadata = load_dataset_metadata()
         
         # Add custom datasets first
-        for name in collection_names:
+        for collection in collections:
+            name = collection["name"]
             # Count documents in collection
             try:
-                coll = chroma_client.get_collection(name=name)
-                # Get all documents from collection to count unique sources
-                results = coll.get(include=["metadatas"])
-                unique_sources = set()
-                for meta in results["metadatas"]:
-                    source = meta.get("source")
-                    if source:
-                        unique_sources.add(source)
-                doc_count = len(unique_sources)  # Count unique documents
-                metadata = dataset_metadata.get(name, {})
-                description = metadata.get("description", f"Custom dataset with {doc_count} entries")
-                author = metadata.get("author")
-                topic = metadata.get("topic")
-                linkedin_url = metadata.get("linkedin_url")
-                custom_instructions = metadata.get("custom_instructions")
-                last_update_date = metadata.get("last_update_date")
+                coll = supabase_client.get_collection(name)
+                if coll:
+                    # Get all documents from collection to count unique sources
+                    results = coll.get(include=["metadatas"])
+                    unique_sources = set()
+                    if results and "metadatas" in results:
+                        for meta in results["metadatas"]:
+                            if meta:  # Check if metadata is not None
+                                source = meta.get("source") or meta.get("file") or meta.get("filename")
+                                if source:
+                                    unique_sources.add(source)
+                    doc_count = len(unique_sources)  # Count unique documents
+                else:
+                    doc_count = 0
+                
+                # Get metadata from Supabase collection
+                supabase_metadata = collection.get("metadata", {})
+                
+                # If description is missing or is the default, create a better one
+                stored_description = supabase_metadata.get("description", "")
+                if not stored_description or stored_description.startswith("Custom dataset with"):
+                    # Build a descriptive text from other metadata
+                    description_parts = []
+                    if supabase_metadata.get("topic"):
+                        description_parts.append(f"Topic: {supabase_metadata.get('topic')}")
+                    if supabase_metadata.get("author"):
+                        description_parts.append(f"by {supabase_metadata.get('author')}")
+                    
+                    if description_parts:
+                        description = " - ".join(description_parts)
+                    else:
+                        description = f"Custom dataset with {doc_count} entries"
+                else:
+                    description = stored_description
+                    
+                author = supabase_metadata.get("author")
+                topic = supabase_metadata.get("topic")
+                linkedin_url = supabase_metadata.get("linkedin_url")
+                custom_instructions = supabase_metadata.get("custom_instructions")
+                last_update_date = supabase_metadata.get("last_update_date")
                 # Use document_count from metadata if available, otherwise use our calculated doc_count
-                document_count = metadata.get("document_count", doc_count)
+                document_count = supabase_metadata.get("document_count", doc_count)
                 all_datasets.append({
                     "name": name, 
                     "description": description,
@@ -455,7 +561,8 @@ def get_datasets():
                 })
             except Exception as e:
                 print(f"Error getting collection info for {name}: {str(e)}")
-                description = dataset_metadata.get(name, {}).get("description", "Custom dataset")
+                supabase_metadata = collection.get("metadata", {})
+                description = supabase_metadata.get("description", "Custom dataset")
                 all_datasets.append({
                     "name": name, 
                     "description": description,
@@ -501,32 +608,34 @@ def create_dataset():
 
         # Check if dataset already exists
         try:
-            chroma_client.get_collection(name=sanitized_name)
-            return jsonify({"error": f"Dataset '{sanitized_name}' already exists"}), 400
+            if supabase_client:
+                supabase_client.get_collection(sanitized_name)
+                return jsonify({"error": f"Dataset '{sanitized_name}' already exists"}), 400
         except Exception:
             # Collection doesn't exist, which is what we want
             pass
 
-        # Create the collection
-        collection = chroma_client.create_collection(
-            name=sanitized_name,
-            hnsw_config=HNSW_CONFIG
-        )
-
-        # Store metadata
-        current_time = datetime.now().isoformat()
-        dataset_metadata = load_dataset_metadata()
-        dataset_metadata[sanitized_name] = {
-            "description": data.get('description', ''),
-            "author": data.get('author', ''),
-            "topic": data.get('topic', ''),
-            "linkedin_url": data.get('linkedin_url', ''),
-            "custom_instructions": data.get('custom_instructions', ''),
-            "created_at": current_time,
-            "last_update_date": current_time,
-            "document_count": 0
-        }
-        save_dataset_metadata(dataset_metadata)
+        # Create the collection with metadata in Supabase
+        if supabase_client:
+            current_time = datetime.now().isoformat()
+            # If description is empty or starts with "Custom dataset with", store empty to let get_datasets generate a better one
+            final_description = data.get('description', '')
+            if not final_description or final_description.startswith("Custom dataset with"):
+                final_description = ""
+            
+            collection_data = supabase_client.create_collection(
+                name=sanitized_name,
+                description=final_description,
+                author=data.get('author', ''),
+                topic=data.get('topic', ''),
+                linkedin_url=data.get('linkedin_url', ''),
+                custom_instructions=data.get('custom_instructions', ''),
+                created_at=current_time,
+                last_update_date=current_time,
+                document_count=0
+            )
+        else:
+            return jsonify({"error": "Database connection not available"}), 500
 
         return jsonify({
             "success": True,
@@ -554,46 +663,38 @@ def delete_dataset(dataset_name):
     if dataset_name in [d['name'] for d in DEFAULT_DATASETS]:
         return jsonify({"error": "Cannot delete default dataset"}), 400
     
-    deleted_from_chroma = False
+    deleted_from_database = False
     deletion_messages = []
     
     try:
-        # Attempt to delete from Chroma
-        chroma_client.delete_collection(name=dataset_name)
-        deleted_from_chroma = True 
-        deletion_messages.append(f"Collection '{dataset_name}' deleted from ChromaDB.")
-        print(f"Successfully deleted collection '{dataset_name}' from ChromaDB.")
-    except Exception as e:
-        # Check if the collection still exists. If not, it's effectively deleted.
-        try:
-            chroma_client.get_collection(name=dataset_name)
-            # If it's still here, then the deletion failed for a more serious reason
-            error_msg = f"Failed to delete collection '{dataset_name}' from ChromaDB: {str(e)}"
-            deletion_messages.append(error_msg)
-            print(error_msg)
-        except Exception:
-            # Collection was not found by get_collection, so it's effectively gone from Chroma
-            deleted_from_chroma = True 
-            msg = f"Collection '{dataset_name}' not found in ChromaDB (considered successfully removed)."
+        # Attempt to delete from Supabase
+        if supabase_client:
+            success = supabase_client.delete_collection(dataset_name)
+            if success:
+                deleted_from_database = True 
+                deletion_messages.append(f"Collection '{dataset_name}' deleted from Supabase.")
+                print(f"Successfully deleted collection '{dataset_name}' from Supabase.")
+            else:
+                error_msg = f"Failed to delete collection '{dataset_name}' from Supabase"
+                deletion_messages.append(error_msg)
+                print(error_msg)
+        else:
+            deleted_from_database = True
+            msg = f"Supabase not available, cannot delete collection '{dataset_name}'"
             deletion_messages.append(msg)
             print(msg)
+    except Exception as e:
+        error_msg = f"Error deleting collection '{dataset_name}': {str(e)}"
+        deletion_messages.append(error_msg)
+        print(error_msg)
             
-    # Attempt to delete from metadata
-    dataset_metadata = load_dataset_metadata()
-    if dataset_name in dataset_metadata:
-        del dataset_metadata[dataset_name]
-        save_dataset_metadata(dataset_metadata)
-        deleted_from_metadata = True
-        msg = f"Dataset '{dataset_name}' deleted from metadata."
-        deletion_messages.append(msg)
-        print(msg)
-    else:
-        deleted_from_metadata = True # Not present is as good as deleted for this step
-        msg = f"Dataset '{dataset_name}' not found in metadata (considered successfully removed from metadata)."
-        deletion_messages.append(msg)
-        print(msg)
+    # Metadata is now stored in Supabase collection, no need to delete from local file
+    deleted_from_metadata = True
+    msg = f"Dataset '{dataset_name}' metadata is managed in Supabase (no local metadata to delete)."
+    deletion_messages.append(msg)
+    print(msg)
 
-    if deleted_from_chroma and deleted_from_metadata:
+    if deleted_from_database and deleted_from_metadata:
         return jsonify({"success": True, "message": f"Dataset '{dataset_name}' successfully deleted. Details: {' '.join(deletion_messages)}"})
     else:
         # Even if one part failed but the other succeeded, it's a partial success from user POV if dataset is gone from list.
@@ -612,73 +713,50 @@ def update_dataset_metadata_route(dataset_name):
     if not data_to_update:
         return jsonify({"error": "No data provided for update"}), 400
 
-    dataset_metadata = load_dataset_metadata()
-    print(f"[DEBUG] Available dataset_metadata keys: {list(dataset_metadata.keys())}")
-
-    # Check if dataset exists in Chroma
+    # Check if dataset exists in Supabase
     try:
-        collection = chroma_client.get_collection(name=dataset_name)
-        exists_in_chroma = True
-        # Get document count from Chroma
-        results = collection.get(include=["metadatas"])
-        unique_sources = set()
-        for meta in results["metadatas"]:
-            source = meta.get("source")
-            if source:
-                unique_sources.add(source)
-        doc_count = len(unique_sources)
-    except Exception:
-        exists_in_chroma = False
-        doc_count = 0
-
-    if dataset_name not in dataset_metadata:
-        # If dataset exists in Chroma but not in metadata, auto-create a minimal entry
-        if exists_in_chroma:
-            current_time = datetime.now().isoformat()
-            dataset_metadata[dataset_name] = {
-                "description": "",
-                "author": "",
-                "topic": "",
-                "linkedin_url": "",
-                "custom_instructions": "",
-                "created_at": current_time,
-                "last_update_date": current_time,
-                "document_count": doc_count  # Use the document count from Chroma
-            }
-            save_dataset_metadata(dataset_metadata)
-            print(f"[DEBUG] Auto-created metadata entry for dataset: '{dataset_name}' with document_count: {doc_count}")
+        if supabase_client:
+            # Try to get the collection to check if it exists
+            collection_data = supabase_client._get_collection_data(dataset_name)
+            exists_in_supabase = True
+            # Get document count from Supabase
+            doc_count = supabase_client.count_documents(dataset_name)
         else:
-            # If dataset does not exist in Chroma, return 404
-            return jsonify({"error": "Dataset not found"}), 404
+            return jsonify({"error": "Database connection not available"}), 500
+    except Exception as e:
+        print(f"[DEBUG] Error checking Supabase collection: {e}")
+        return jsonify({"error": "Dataset not found"}), 404
 
     # Also check if it's a default dataset, which shouldn't be "updated" via this mechanism
     if any(d['name'] == dataset_name for d in DEFAULT_DATASETS):
         return jsonify({"error": "Default datasets cannot be modified."}), 403
 
-    # Update only the allowed fields
-    # Ensure all expected fields are present even if empty, to allow clearing them
-    current_meta = dataset_metadata.get(dataset_name, {})
-    current_meta["description"] = data_to_update.get("description", current_meta.get("description", ""))
-    current_meta["author"] = data_to_update.get("author", current_meta.get("author", ""))
-    current_meta["topic"] = data_to_update.get("topic", current_meta.get("topic", ""))
-    current_meta["last_update_date"] = datetime.now().isoformat()  # Update the last update date
-    
-    linkedin_url = data_to_update.get("linkedin_url", "")
-    if linkedin_url:
-        current_meta["linkedin_url"] = linkedin_url
-    else:
-        current_meta.pop("linkedin_url", None)
+    # Update metadata in Supabase
+    try:
+        current_time = datetime.now().isoformat()
         
-    custom_instructions = data_to_update.get("custom_instructions", "")
-    if custom_instructions:
-        current_meta["custom_instructions"] = custom_instructions
-    else:
-        current_meta.pop("custom_instructions", None)
-
-    dataset_metadata[dataset_name] = current_meta
-    save_dataset_metadata(dataset_metadata)
-
-    return jsonify({"success": True, "message": f"Dataset '{dataset_name}' updated successfully."})
+        # Prepare metadata updates
+        metadata_updates = {
+            "description": data_to_update.get("description", ""),
+            "author": data_to_update.get("author", ""),
+            "topic": data_to_update.get("topic", ""),
+            "linkedin_url": data_to_update.get("linkedin_url", ""),
+            "custom_instructions": data_to_update.get("custom_instructions", ""),
+            "last_update_date": current_time,
+            "document_count": doc_count
+        }
+        
+        # Update collection metadata in Supabase
+        success = supabase_client.update_collection_metadata(dataset_name, **metadata_updates)
+        
+        if not success:
+            return jsonify({"error": "Failed to update dataset metadata"}), 500
+        
+        return jsonify({"success": True, "message": f"Dataset '{dataset_name}' updated successfully."})
+        
+    except Exception as e:
+        print(f"[DEBUG] Error updating dataset metadata: {e}")
+        return jsonify({"error": "Failed to update dataset metadata"}), 500
 
 @app.route('/api/process-documents', methods=['POST'])
 def process_documents():
@@ -686,10 +764,17 @@ def process_documents():
     # This would handle file uploads in production
     # For now, we'll process the existing documents
     
-    dataset_name = request.json.get('dataset_name', 'EU-Sanctions')
+    dataset_name = request.json.get('dataset_name', 'Default')
     
     # Create or get collection
-    collection = chroma_client.get_or_create_collection(name=dataset_name)
+    collection = supabase_client.get_or_create_collection(dataset_name)
+    
+    if not collection:
+        return jsonify({
+            "status": "error",
+            "message": "Database connection not available",
+            "dataset": dataset_name
+        })
     
     # Process PDF files
     documents = []
@@ -754,25 +839,53 @@ def process_documents():
         except Exception as e:
             print(f"Error processing {file_path}: {str(e)}")
     
-    # Add to Chroma
-    # In real implementation, use embeddings model to vectorize
+    # Add to Supabase with embeddings
     for i in range(0, len(documents), 100):  # Batch processing
         batch_docs = documents[i:i+100]
         batch_meta = metadatas[i:i+100]
         batch_ids = ids[i:i+100]
         
+        # Generate embeddings for the batch with SSL error handling
+        try:
+            batch_embeddings = embeddings.embed_documents(batch_docs)
+        except Exception as e:
+            if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
+                print(f"SSL error generating embeddings, retrying individually with delay: {e}")
+                batch_embeddings = []
+                for doc in batch_docs:
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            time.sleep(1)  # Wait 1 second between attempts
+                            doc_embedding = embeddings.embed_documents([doc])
+                            batch_embeddings.extend(doc_embedding)
+                            break
+                        except Exception as retry_e:
+                            if attempt == max_retries - 1:
+                                print(f"Failed to generate embedding for document after {max_retries} attempts: {retry_e}")
+                                # Use zero vector as fallback
+                                batch_embeddings.append([0.0] * 1024)  # 1024-dim embeddings for BAAI/bge-large-en-v1.5
+                            else:
+                                print(f"Retry {attempt + 1}/{max_retries} failed: {retry_e}")
+                                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                raise e
+        
         collection.add(
             documents=batch_docs,
+            embeddings=batch_embeddings,
             metadatas=batch_meta,
             ids=batch_ids
         )
     
-    # Store dataset description
+    # Store dataset description in Supabase
     dataset_description = request.json.get('dataset_description', '')
     if dataset_description:
-        dataset_metadata = load_dataset_metadata()
-        dataset_metadata[dataset_name] = {"description": dataset_description}
-        save_dataset_metadata(dataset_metadata)
+        supabase_client.update_collection_metadata(
+            dataset_name, 
+            description=dataset_description,
+            last_update_date=datetime.now().isoformat()
+        )
     
     return jsonify({
         "status": "success",
@@ -814,18 +927,28 @@ def upload_documents():
             
             # Check if dataset already exists
             try:
-                chroma_client.get_collection(name=dataset_name)
-                yield json.dumps({"status": "error", "message": f"Dataset '{dataset_name}' already exists"}) + "\n"
-                return
+                if supabase_client:
+                    supabase_client.get_collection(dataset_name)
+                    yield json.dumps({"status": "error", "message": f"Dataset '{dataset_name}' already exists"}) + "\n"
+                    return
             except Exception:
                 # Collection doesn't exist, which is what we want
                 pass
 
             # Create collection
-            collection = chroma_client.create_collection(
-                name=sanitized_name,
-                hnsw_config=HNSW_CONFIG
-            )
+            if supabase_client:
+                collection_data = supabase_client.create_collection(
+                    name=sanitized_name,
+                    description=dataset_description,
+                    author=dataset_author,
+                    topic=dataset_topic,
+                    linkedin_url=dataset_linkedin,
+                    custom_instructions=dataset_custom_instructions
+                )
+                collection = SupabaseCollection(supabase_client, sanitized_name, collection_data)
+            else:
+                yield json.dumps({"status": "error", "message": "Database connection not available"}) + "\n"
+                return
             
             # Process uploaded files
             files = request.files.getlist('files')
@@ -867,31 +990,67 @@ def upload_documents():
                     except Exception as e:
                         print(f"Error removing temporary file {file_path}: {str(e)}")
             
-            # Add to Chroma in batches
+            # Add to Supabase in batches with embeddings
             for i in range(0, len(documents), 100):
                 batch_docs = documents[i:i+100]
                 batch_meta = metadatas[i:i+100]
                 batch_ids = ids[i:i+100]
+                
+                # Generate embeddings for the batch with SSL error handling
+                try:
+                    batch_embeddings = embeddings.embed_documents(batch_docs)
+                except Exception as e:
+                    if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
+                        print(f"SSL error generating embeddings, retrying individually with delay: {e}")
+                        batch_embeddings = []
+                        for doc in batch_docs:
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                try:
+                                    time.sleep(1)  # Wait 1 second between attempts
+                                    doc_embedding = embeddings.embed_documents([doc])
+                                    batch_embeddings.extend(doc_embedding)
+                                    break
+                                except Exception as retry_e:
+                                    if attempt == max_retries - 1:
+                                        print(f"Failed to generate embedding for document after {max_retries} attempts: {retry_e}")
+                                        # Use zero vector as fallback
+                                        batch_embeddings.append([0.0] * 1024)  # 1024-dim embeddings for BAAI/bge-large-en-v1.5
+                                    else:
+                                        print(f"Retry {attempt + 1}/{max_retries} failed: {retry_e}")
+                                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        raise e
+                
                 collection.add(
                     documents=batch_docs,
+                    embeddings=batch_embeddings,
                     metadatas=batch_meta,
                     ids=batch_ids
                 )
             
-            # Update dataset metadata
+            # Update dataset metadata in Supabase
             current_time = datetime.now().isoformat()
-            dataset_metadata = load_dataset_metadata()
-            dataset_metadata[dataset_name] = {
-                "description": dataset_description,
-                "author": dataset_author,
-                "topic": dataset_topic,
-                "linkedin_url": dataset_linkedin,
-                "custom_instructions": dataset_custom_instructions,
-                "created_at": current_time,
-                "last_update_date": current_time,
-                "document_count": total_documents
-            }
-            save_dataset_metadata(dataset_metadata)
+            # If description is empty or starts with "Custom dataset with", store empty to let get_datasets generate a better one
+            final_description = dataset_description
+            if not dataset_description or dataset_description.startswith("Custom dataset with"):
+                final_description = ""
+            
+            # Update collection metadata in Supabase
+            supabase_client.update_collection_metadata(
+                dataset_name,
+                description=final_description,
+                author=dataset_author,
+                topic=dataset_topic,
+                linkedin_url=dataset_linkedin,
+                custom_instructions=dataset_custom_instructions,
+                created_at=current_time,
+                last_update_date=current_time,
+                document_count=total_documents
+            )
+            
+            # Small delay to ensure metadata is written to disk
+            time.sleep(0.1)
             
             yield json.dumps({"progress": 1.0, "status": "Processing complete!"}) + "\n"
             
@@ -926,24 +1085,10 @@ def rename_folder_route(folder_id):
     if not new_name:
         return jsonify({'error': 'Missing new folder name'}), 400
 
-    # Load folders
-    folders = chat_storage.list_folders()
-    found = False
-    for folder in folders:
-        if folder['id'] == folder_id:
-            folder['name'] = new_name
-            folder['last_updated'] = time.time()
-            found = True
-            break
-    if not found:
+    # Update folder
+    success = chat_storage.update_folder(folder_id, new_name)
+    if not success:
         return jsonify({'error': 'Folder not found'}), 404
-
-    # Save folders
-    # chat_storage does not have a save_folders, so we update the file directly
-    import os, json
-    folders_file = os.path.join(chat_storage.storage_dir, "folders.json")
-    with open(folders_file, 'w') as f:
-        json.dump({"folders": folders}, f, indent=2)
 
     return jsonify({'success': True})
 
@@ -969,10 +1114,55 @@ def delete_folder_route(folder_id):
 # Chat API routes
 @app.route('/api/chats', methods=['GET'])
 def list_chats():
-    """List all chats."""
+    """List all chats with message counts and proper timestamps."""
     folder_id = request.args.get('folder_id')
     chats = chat_storage.list_chats(folder_id)
-    return jsonify(chats)
+    
+    # Enhance each chat with message count and format timestamps
+    enhanced_chats = []
+    for chat in chats:
+        # Get message count for this chat
+        try:
+            messages = chat_storage.client.table("messages").select("id").eq("chat_id", chat["id"]).execute()
+            message_count = len(messages.data) if messages.data else 0
+        except Exception as e:
+            print(f"Error getting message count for chat {chat['id']}: {e}")
+            message_count = 0
+        
+        # Format timestamp - convert to Unix timestamp for JavaScript
+        try:
+            from datetime import datetime
+            import time
+            
+            # Parse the ISO timestamp from Supabase
+            if chat.get('updated_at'):
+                dt = datetime.fromisoformat(chat['updated_at'].replace('Z', '+00:00'))
+                updated_timestamp = int(dt.timestamp())
+            else:
+                updated_timestamp = int(time.time())  # Current time as fallback
+                
+            # Also format created_at
+            if chat.get('created_at'):
+                dt = datetime.fromisoformat(chat['created_at'].replace('Z', '+00:00'))
+                created_timestamp = int(dt.timestamp())
+            else:
+                created_timestamp = updated_timestamp
+        except Exception as e:
+            print(f"Error formatting timestamp for chat {chat['id']}: {e}")
+            import time
+            updated_timestamp = int(time.time())
+            created_timestamp = updated_timestamp
+        
+        # Create enhanced chat object
+        enhanced_chat = {
+            **chat,
+            'message_count': message_count,
+            'updated_at': updated_timestamp,
+            'created_at': created_timestamp
+        }
+        enhanced_chats.append(enhanced_chat)
+    
+    return jsonify(enhanced_chats)
 
 @app.route('/api/chats', methods=['POST'])
 def create_chat():
@@ -980,15 +1170,11 @@ def create_chat():
     data = request.json
     title = data.get('title')
     folder_id = data.get('folder_id', 'default')
-    dataset = data.get('dataset')
+    dataset = data.get('dataset', DEFAULT_DATASET_NAME)
     
-    chat_id = chat_storage.create_chat(title, folder_id)
+    chat_data = chat_storage.create_chat(title, folder_id, dataset)
     
-    # Update dataset if provided
-    if dataset:
-        chat_storage.update_chat(chat_id, {"dataset": dataset})
-    
-    return jsonify({"id": chat_id})
+    return jsonify({"id": chat_data["id"]})
 
 @app.route('/api/chats/<chat_id>/move', methods=['POST'])
 def move_chat_to_folder_route(chat_id):
@@ -1056,7 +1242,7 @@ def get_chat(chat_id):
 def update_chat_route(chat_id):
     """Update a chat."""
     data = request.json
-    success = chat_storage.update_chat(chat_id, data)
+    success = chat_storage.update_chat(chat_id, **data)
     
     if not success:
         return jsonify({"error": "Chat not found"}), 404
@@ -1068,13 +1254,17 @@ def delete_chat(chat_id):
     """Delete a chat and return the next most recent chat."""
     result = chat_storage.delete_chat(chat_id)
     
-    if not result["success"]:
-        return jsonify({"error": result["message"]}), 404
+    if not result:
+        return jsonify({"error": "Failed to delete chat"}), 404
+    
+    # Get the next most recent chat
+    all_chats = chat_storage.list_chats()
+    next_chat = all_chats[0] if all_chats else None
     
     return jsonify({
         "success": True,
-        "next_chat": result.get("next_chat"),
-        "message": result["message"]
+        "next_chat": next_chat,
+        "message": "Chat deleted successfully"
     })
 
 @app.route('/api/chats/<chat_id>/messages', methods=['POST'])
@@ -1094,21 +1284,48 @@ def add_message(chat_id):
         return jsonify({"error": "Chat not found"}), 404
     print(f"[CHAT_API] Chat {chat_id} retrieved.")
     
-    # Use the chat's dataset if not specified
+    # Use the chat's dataset if not specified, fallback to default dataset
     if not dataset_name:
-        dataset_name = chat.get('dataset', 'Default')
-    elif dataset_name != chat.get('dataset'):
-        # Update the chat's dataset if it changed
-        chat_storage.update_chat(chat_id, {"dataset": dataset_name})
+        dataset_name = chat.get('dataset', DEFAULT_DATASET_NAME or 'Default')
+    
+    # Validate that the dataset exists
+    available_datasets = []
+    if supabase_client:
+        try:
+            collections = supabase_client.list_collections()
+            available_datasets = [c["name"] for c in collections]
+        except Exception as e:
+            print(f"[CHAT_API] Error getting datasets: {e}")
+    
+    # If the dataset doesn't exist, use the first available one or DEFAULT_DATASET_NAME
+    if dataset_name not in available_datasets:
+        print(f"[CHAT_API] Dataset '{dataset_name}' not found in available datasets: {available_datasets}")
+        if available_datasets:
+            dataset_name = available_datasets[0]
+            print(f"[CHAT_API] Using first available dataset: '{dataset_name}'")
+        elif DEFAULT_DATASET_NAME:
+            dataset_name = DEFAULT_DATASET_NAME
+            print(f"[CHAT_API] Using default dataset: '{dataset_name}'")
+        else:
+            return jsonify({"error": "No datasets available. Please create a dataset first."}), 400
+    
+    # Update the chat's dataset if it changed
+    if dataset_name != chat.get('dataset'):
+        chat_storage.update_chat(chat_id, **{"dataset": dataset_name})
     
     # Update the model if it changed
     if model_name != chat.get('model', MODEL_NAME):
-        chat_storage.update_chat(chat_id, {"model": model_name})
+        chat_storage.update_chat(chat_id, **{"model": model_name})
     
-    # Load dataset-specific custom instructions
-    dataset_metadata = load_dataset_metadata()
-    specific_dataset_meta = dataset_metadata.get(dataset_name, {})
-    custom_instructions_for_dataset = specific_dataset_meta.get("custom_instructions", "")
+    # Load dataset-specific custom instructions from Supabase
+    custom_instructions_for_dataset = ""
+    try:
+        collection = supabase_client.get_collection(dataset_name)
+        if collection and hasattr(collection, 'collection_data'):
+            metadata = collection.collection_data.get('metadata', {})
+            custom_instructions_for_dataset = metadata.get("custom_instructions", "")
+    except Exception as e:
+        print(f"[CHAT_API] Error loading custom instructions for {dataset_name}: {e}")
     
     # Add user message
     print("[CHAT_API] Attempting to add user message to storage...")
@@ -1132,7 +1349,6 @@ def add_message(chat_id):
     # Initialize document processor with the same settings as configured globally
     doc_processor = LegalDocumentProcessor(
         embedding_model=EMBEDDING_MODEL,
-        chroma_path=CHROMA_DIR,
         device=device
     )
     
@@ -1140,7 +1356,7 @@ def add_message(chat_id):
     results = doc_processor.query_dataset(
         dataset_name=dataset_name,
         query=user_message,
-        n_results=5,
+        n_results=8,  # Increased from 5 to 8 for better context
         use_hybrid_search=True,
         use_reranking=True
     )
@@ -1175,18 +1391,22 @@ def add_message(chat_id):
         - If you don't know the answer or it's not in the context, state this clearly
         
         # Output Format
-        Structure your response with these sections:
-        1. SOURCES: A brief bulleted list of the most relevant source documents you're drawing from
-        2. ANALYSIS: Your step-by-step reasoning about the question (this should be detailed)
-        3. APPLICABLE PROVISIONS: Specific articles, sections, or legal provisions that apply
-        4. CONCLUSION: Your final answer based on the analysis
+        Structure your response with these sections, using **bold** formatting for section titles:
+        1. **SOURCES**: A brief bulleted list of the most relevant source documents you're drawing from
+        2. **ANALYSIS**: Your step-by-step reasoning about the question (this should be detailed)
+        3. **APPLICABLE PROVISIONS**: Specific articles, sections, or legal provisions that apply
+        4. **CONCLUSION**: Your final answer based on the analysis
+        
+        Important: Always format section headers in bold using **TITLE**: format
         
         # Context
         {context}
         """
     
     def generate():
-        nonlocal full_response, saved_response_length
+        # Initialize variables in the outer scope
+        full_response = ""
+        saved_response_length = 0
         
         # Prepare messages for the LLM
         messages = []
@@ -1213,7 +1433,7 @@ def add_message(chat_id):
             query=user_message,
             context=context,  # Pass the actual context here
             chat_history=messages,
-            temperature=0.1
+            temperature=0.3
         ):
             print(f"[CHAT_API] In generate(): Received chunk: {chunk[:50]}...")
             full_response += chunk
@@ -1228,8 +1448,9 @@ def add_message(chat_id):
         # Yield a completion event 
         yield f"data: {json.dumps({'done': True})}\n\n"
         
-        # Make sure to save the final complete response
-        finalize_message(chat_id, full_response)
+        # Make sure to save the final complete response with bold formatting
+        formatted_response = format_response_with_bold_headers(full_response)
+        finalize_message(chat_id, formatted_response)
     
     print("[CHAT_API] Returning streaming response object.")
     return Response(stream_with_context(generate()), mimetype='text/event-stream')
@@ -1872,28 +2093,42 @@ from flask import send_from_directory
 
 @app.route('/api/datasets/<dataset_name>/documents', methods=['GET'])
 def list_dataset_documents(dataset_name):
-    """List all documents in a dataset (by Chroma collection metadata)."""
+    """List all documents in a dataset (by Supabase collection metadata)."""
+    print(f"[DEBUG] list_dataset_documents called for: {dataset_name}")
     try:
-        collection = chroma_client.get_collection(name=dataset_name)
+        if not supabase_client:
+            print("[DEBUG] No supabase_client available")
+            return jsonify([]), 200
+            
+        collection = supabase_client.get_collection(name=dataset_name)
+        if not collection:
+            return jsonify({"documents": [], "error": "Collection not found"}), 404
+            
         results = collection.get(include=["metadatas"])  # Only metadatas, ids always returned
-        print(f"[DEBUG] Chroma collection metadatas for {dataset_name}:")
+        total_chunks = len(results.get("ids", []))
+        print(f"[DEBUG] Found {total_chunks} total chunks in collection {dataset_name}")
+        print(f"[DEBUG] Supabase collection metadatas for {dataset_name}:")
         for meta, doc_id in zip(results["metadatas"], results["ids"]):
             print(f"  id={doc_id} meta={meta}")
         docs = {}
         for meta, doc_id in zip(results["metadatas"], results["ids"]):
             filename = meta.get("source") or meta.get("file") or meta.get("filename")
             if not filename:
+                print(f"[DEBUG] Skipping chunk {doc_id} - no filename in metadata: {meta}")
                 continue
             if filename not in docs:
                 docs[filename] = {"filename": filename, "ids": [], "id": filename}
             docs[filename]["ids"].append(doc_id)
         doc_list = list(docs.values())
+        print(f"[DEBUG] Processed {len(doc_list)} unique documents from {total_chunks} chunks")
         if not doc_list:
-            # Return all metadatas for debugging
-            return jsonify({"documents": [], "debug_metadatas": results["metadatas"]}), 200
+            # Return empty array to match expected format
+            return jsonify([]), 200
         return jsonify(doc_list)
     except Exception as e:
         print(f"Error listing documents for dataset {dataset_name}: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify([]), 200
 
 @app.route('/api/datasets/<dataset_name>/documents', methods=['POST'])
@@ -1905,6 +2140,13 @@ def upload_documents_to_dataset(dataset_name):
                 yield json.dumps({"status": "error", "message": "No files uploaded"}) + "\n"
                 return
 
+            # Get form data (metadata fields)
+            dataset_description = request.form.get('dataset_description', '')
+            dataset_author = request.form.get('dataset_author', '')
+            dataset_topic = request.form.get('dataset_topic', '')
+            dataset_linkedin = request.form.get('dataset_linkedin', '')
+            dataset_custom_instructions = request.form.get('dataset_custom_instructions', '')
+            
             # Save uploaded files
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             upload_path = os.path.join(app.config['UPLOAD_FOLDER'], timestamp)
@@ -1928,18 +2170,27 @@ def upload_documents_to_dataset(dataset_name):
                 return
 
             # Get collection
-            collection = chroma_client.get_or_create_collection(name=dataset_name)
+            collection = supabase_client.get_or_create_collection(dataset_name)
+            if not collection:
+                yield json.dumps({"status": "error", "message": "Database connection not available"}) + "\n"
+                return
             
-            # Process and add to Chroma
+            # Process and add to Supabase
             documents = []
             metadatas = []
             ids = []
             total_documents = len(saved_files)  # This is the number of actual files uploaded
             
-            # Get existing metadata
-            dataset_metadata = load_dataset_metadata()
-            current_metadata = dataset_metadata.get(dataset_name, {})
-            existing_doc_count = current_metadata.get("document_count", 0)
+            # Get existing metadata from Supabase
+            current_metadata = {}
+            existing_doc_count = 0
+            try:
+                existing_collection = supabase_client.get_collection(dataset_name)
+                if existing_collection and hasattr(existing_collection, 'collection_data'):
+                    current_metadata = existing_collection.collection_data.get('metadata', {})
+                    existing_doc_count = current_metadata.get("document_count", 0)
+            except Exception as e:
+                print(f"Could not retrieve existing metadata for {dataset_name}: {e}")
             
             # Update progress for file processing
             yield json.dumps({"progress": 0.2, "status": "Processing files..."}) + "\n"
@@ -1981,13 +2232,57 @@ def upload_documents_to_dataset(dataset_name):
             yield json.dumps({"progress": 0.6, "status": "Adding to database..."}) + "\n"
             time.sleep(0.5)  # Simulate processing delay
             
-            # Add to Chroma in batches
+            # Add to Supabase in batches with embeddings
             total_batches = (len(documents) + 99) // 100
             for i in range(0, len(documents), 100):
                 batch_docs = documents[i:i+100]
                 batch_meta = metadatas[i:i+100]
                 batch_ids = ids[i:i+100]
-                collection.add(documents=batch_docs, metadatas=batch_meta, ids=batch_ids)
+                
+                # Generate embeddings for the batch with SSL error handling
+                try:
+                    batch_embeddings = embeddings.embed_documents(batch_docs)
+                except Exception as e:
+                    if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
+                        print(f"SSL error generating embeddings, retrying individually with delay: {e}")
+                        batch_embeddings = []
+                        for doc in batch_docs:
+                            max_retries = 3
+                            for attempt in range(max_retries):
+                                try:
+                                    time.sleep(1)  # Wait 1 second between attempts
+                                    doc_embedding = embeddings.embed_documents([doc])
+                                    batch_embeddings.extend(doc_embedding)
+                                    break
+                                except Exception as retry_e:
+                                    if attempt == max_retries - 1:
+                                        print(f"Failed to generate embedding for document after {max_retries} attempts: {retry_e}")
+                                        # Use zero vector as fallback
+                                        batch_embeddings.append([0.0] * 1024)  # 1024-dim embeddings for BAAI/bge-large-en-v1.5
+                                    else:
+                                        print(f"Retry {attempt + 1}/{max_retries} failed: {retry_e}")
+                                        time.sleep(2 ** attempt)  # Exponential backoff
+                    else:
+                        raise e
+                
+                # Add documents to collection with error handling
+                try:
+                    success = collection.add(
+                        documents=batch_docs,
+                        embeddings=batch_embeddings,
+                        metadatas=batch_meta,
+                        ids=batch_ids
+                    )
+                    if not success:
+                        error_msg = f"Failed to add batch {i//100 + 1} to database"
+                        print(error_msg)
+                        yield json.dumps({"status": "error", "message": error_msg}) + "\n"
+                        return
+                except Exception as add_error:
+                    error_msg = f"Error adding batch {i//100 + 1} to database: {str(add_error)}"
+                    print(error_msg)
+                    yield json.dumps({"status": "error", "message": error_msg}) + "\n"
+                    return
                 
                 # Update progress during batch processing
                 batch_progress = 0.6 + (0.3 * (i // 100 + 1) / total_batches)
@@ -1995,27 +2290,89 @@ def upload_documents_to_dataset(dataset_name):
                 time.sleep(0.5)  # Simulate processing delay
             
             # Update dataset metadata with the correct document count
-            if dataset_name in dataset_metadata:
-                # Get current unique documents from collection
+            # Always update metadata, whether it's a new or existing dataset
+            # Get current unique documents from collection
+            try:
                 results = collection.get(include=["metadatas"])
                 current_unique_sources = set()
-                for meta in results["metadatas"]:
-                    source = meta.get("source")
-                    if source:
-                        current_unique_sources.add(source)
                 
-                # Add new unique documents
-                for doc_file in saved_files:
-                    current_unique_sources.add(doc_file)
+                # Debug logging
+                print(f"Retrieved {len(results.get('metadatas', []))} total chunks from collection")
                 
-                # Update metadata with total unique documents
-                current_metadata["document_count"] = len(current_unique_sources)
-                current_metadata["last_update_date"] = datetime.now().isoformat()
-                dataset_metadata[dataset_name] = current_metadata
-                save_dataset_metadata(dataset_metadata)
+                # Count unique source files from all chunks
+                if results and "metadatas" in results:
+                    for meta in results["metadatas"]:
+                        if meta:  # Check if metadata is not None
+                            source = meta.get("source") or meta.get("file") or meta.get("filename")
+                            if source:
+                                current_unique_sources.add(source)
+                
+                print(f"Found {len(current_unique_sources)} unique source files in collection")
+                
+                # Note: saved_files are already added to the collection above,
+                # so they should already be in current_unique_sources.
+                # We don't need to add them again.
+                
+            except Exception as e:
+                print(f"Error counting documents: {e}")
+                # Fallback: count the newly uploaded files
+                current_unique_sources = set(saved_files)
+            
+            # Update metadata in Supabase
+            current_time = datetime.now().isoformat()
+            
+            # If description is empty or starts with "Custom dataset with", store empty to let get_datasets generate a better one
+            final_description = dataset_description
+            if not dataset_description or dataset_description.startswith("Custom dataset with"):
+                final_description = ""
+            
+            # Prepare metadata update - preserve existing metadata when fields are empty
+            metadata_update = {
+                "document_count": len(current_unique_sources),
+                "last_update_date": current_time
+            }
+            
+            # Only update metadata fields if they are provided (not empty)
+            # Otherwise, preserve existing values
+            if dataset_description:
+                metadata_update["description"] = final_description
+            elif "description" in current_metadata:
+                metadata_update["description"] = current_metadata["description"]
+                
+            if dataset_author:
+                metadata_update["author"] = dataset_author
+            elif "author" in current_metadata:
+                metadata_update["author"] = current_metadata["author"]
+                
+            if dataset_topic:
+                metadata_update["topic"] = dataset_topic
+            elif "topic" in current_metadata:
+                metadata_update["topic"] = current_metadata["topic"]
+                
+            if dataset_linkedin:
+                metadata_update["linkedin_url"] = dataset_linkedin
+            elif "linkedin_url" in current_metadata:
+                metadata_update["linkedin_url"] = current_metadata["linkedin_url"]
+                
+            if dataset_custom_instructions:
+                metadata_update["custom_instructions"] = dataset_custom_instructions
+            elif "custom_instructions" in current_metadata:
+                metadata_update["custom_instructions"] = current_metadata["custom_instructions"]
+            
+            # Add created_at timestamp if this is a new dataset
+            if "created_at" not in current_metadata:
+                metadata_update["created_at"] = current_time
+            else:
+                metadata_update["created_at"] = current_metadata["created_at"]
+            
+            # Update collection metadata in Supabase
+            supabase_client.update_collection_metadata(dataset_name, **metadata_update)
+            
+            # Small delay to ensure metadata is written to disk
+            time.sleep(0.1)
             
             # Final progress update with success message
-            yield json.dumps({"progress": 1.0, "status": "Upload complete!", "success": True}) + "\n"
+            yield json.dumps({"progress": 1.0, "status": f"Processed {len(documents)} text chunks from {total_documents} documents. Upload complete!", "success": True}) + "\n"
             
         except Exception as e:
             print(f"Error uploading documents to dataset {dataset_name}: {e}")
@@ -2027,7 +2384,9 @@ def upload_documents_to_dataset(dataset_name):
 def delete_document_from_dataset(dataset_name, doc_id):
     """Delete a document and all its chunks from a dataset."""
     try:
-        collection = chroma_client.get_collection(name=dataset_name)
+        collection = supabase_client.get_collection(name=dataset_name)
+        if not collection:
+            return jsonify({"success": False, "message": "Collection not found."}), 404
         # Find all ids for this document (by filename)
         results = collection.get(include=["metadatas"])  # Only metadatas, ids always returned
         ids_to_delete = [id_ for meta, id_ in zip(results["metadatas"], results["ids"]) if meta.get("source") == doc_id or meta.get("file") == doc_id or meta.get("filename") == doc_id]
@@ -2037,23 +2396,21 @@ def delete_document_from_dataset(dataset_name, doc_id):
         # Delete the chunks
         collection.delete(ids=ids_to_delete)
         
-        # Update dataset metadata with new document count
-        dataset_metadata = load_dataset_metadata()
-        if dataset_name in dataset_metadata:
-            # Get current unique documents from collection after deletion
-            results = collection.get(include=["metadatas"])
-            current_unique_sources = set()
-            for meta in results["metadatas"]:
-                source = meta.get("source")
-                if source:
-                    current_unique_sources.add(source)
-            
-            # Update metadata with new document count
-            current_metadata = dataset_metadata[dataset_name]
-            current_metadata["document_count"] = len(current_unique_sources)
-            current_metadata["last_update_date"] = datetime.now().isoformat()
-            dataset_metadata[dataset_name] = current_metadata
-            save_dataset_metadata(dataset_metadata)
+        # Update dataset metadata in Supabase with new document count
+        # Get current unique documents from collection after deletion
+        results = collection.get(include=["metadatas"])
+        current_unique_sources = set()
+        for meta in results["metadatas"]:
+            source = meta.get("source")
+            if source:
+                current_unique_sources.add(source)
+        
+        # Update metadata in Supabase
+        supabase_client.update_collection_metadata(
+            dataset_name,
+            document_count=len(current_unique_sources),
+            last_update_date=datetime.now().isoformat()
+        )
         
         return jsonify({"success": True, "message": f"Deleted document {doc_id} and its chunks."})
     except Exception as e:
@@ -2066,11 +2423,15 @@ def check_dataset_name():
     name = request.args.get('name', '').strip()
     if not name:
         return jsonify({"taken": False, "error": "No name provided"}), 400
-    collections = chroma_client.list_collections()
-    collection_names = [c.name for c in collections]
-    if name in collection_names:
-        return jsonify({"taken": True})
-    return jsonify({"taken": False})
+    
+    if supabase_client:
+        try:
+            supabase_client.get_collection(name)
+            return jsonify({"taken": True})
+        except Exception:
+            return jsonify({"taken": False})
+    else:
+        return jsonify({"taken": False, "error": "Database connection not available"})
 
 # Add an alias for the update endpoint to support /update
 @app.route('/api/datasets/<dataset_name>/update', methods=['PUT'])
@@ -2087,13 +2448,12 @@ def update_streaming_message(chat_id: str, content: str) -> None:
             # Find the last message (which should be the streaming one)
             last_message = chat['messages'][-1]
             if last_message['role'] == 'assistant':
-                last_message['content'] = content
-                last_message['metadata'] = last_message.get('metadata', {})
-                last_message['metadata']['streaming'] = True
-                # Save the updated chat
-                chat_file = os.path.join(chat_storage.storage_dir, f"{chat_id}.json")
-                with open(chat_file, 'w') as f:
-                    json.dump(chat, f, indent=2)
+                # Update message content using Supabase service
+                chat_storage.update_message(
+                    message_id=last_message['id'],
+                    content=content,
+                    metadata={'streaming': True}
+                )
     except Exception as e:
         print(f"Error updating streaming message: {str(e)}")
 
@@ -2105,13 +2465,12 @@ def finalize_message(chat_id: str, content: str) -> None:
             # Find the last message (which should be the streaming one)
             last_message = chat['messages'][-1]
             if last_message['role'] == 'assistant':
-                last_message['content'] = content
-                last_message['metadata'] = last_message.get('metadata', {})
-                last_message['metadata']['streaming'] = False
-                # Save the updated chat
-                chat_file = os.path.join(chat_storage.storage_dir, f"{chat_id}.json")
-                with open(chat_file, 'w') as f:
-                    json.dump(chat, f, indent=2)
+                # Update message content using Supabase service
+                chat_storage.update_message(
+                    message_id=last_message['id'],
+                    content=content,
+                    metadata={'streaming': False}
+                )
     except Exception as e:
         print(f"Error finalizing message: {str(e)}")
 

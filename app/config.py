@@ -15,9 +15,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Document paths
 DOCUMENTS_DIR = os.path.join(BASE_DIR, "data", "documents")
 
-# DeepSeek API settings
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-DEEPSEEK_API_BASE = "https://api.deepseek.com/v1"
 
 # OpenRouter API settings
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -30,8 +27,11 @@ AVAILABLE_MODELS = os.environ.get("OPENROUTER_MODELS", "meta-llama/llama-3.3-8b-
 EMBEDDING_MODEL = "BAAI/bge-large-en-v1.5"  # Good for legal documents
 PROCESSING_MODEL = "mistralai/mixtral-8x7b-instruct-v0.1"  # For document processing
 
-# Chroma settings
-CHROMA_DIR = os.path.join(BASE_DIR, "data", "chroma")
+# Supabase settings
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
 
 # App settings
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
@@ -93,23 +93,9 @@ ROLE_PERMISSIONS = {
 ENABLE_AUDIT_LOGGING = os.environ.get("ENABLE_AUDIT_LOGGING", "True").lower() == "true"
 AUDIT_LOG_DIR = os.path.join(BASE_DIR, "data", "audit_logs")
 
-# Amazon S3 settings (for scalable storage)
-AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY", "")
-AWS_SECRET_KEY = os.environ.get("AWS_SECRET_KEY", "")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
-AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "")
-USE_S3_STORAGE = os.environ.get("USE_S3_STORAGE", "False").lower() == "true"
 
 # Document encryption settings
 ENCRYPTION_ENABLED = os.environ.get("ENCRYPTION_ENABLED", "True").lower() == "true"
 SECURE_PROCESSING = os.environ.get("SECURE_PROCESSING", "True").lower() == "true"
 
-# User registration settings
-ALLOW_REGISTRATION = os.environ.get("ALLOW_REGISTRATION", "True").lower() == "true"
-REQUIRE_EMAIL_VERIFICATION = os.environ.get("REQUIRE_EMAIL_VERIFICATION", "False").lower() == "true"
-ADMIN_APPROVAL_REQUIRED = os.environ.get("ADMIN_APPROVAL_REQUIRED", "False").lower() == "true"
 
-# API rate limiting
-RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "True").lower() == "true"
-RATE_LIMIT_DEFAULT = int(os.environ.get("RATE_LIMIT_DEFAULT", 100))  # Per hour
-RATE_LIMIT_AUTH = int(os.environ.get("RATE_LIMIT_AUTH", 10))  # Per minute

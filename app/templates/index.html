@@ -143,7 +143,7 @@
                 <div class="flex items-center space-x-4">
                     <div class="text-sm text-gray-600 flex items-center">
                         Dataset: 
-                        <span id="current-dataset-indicator" class="font-semibold text-blue-700 mx-1">EU-Sanctions</span>
+                        <span id="current-dataset-indicator" class="font-semibold text-blue-700 mx-1">TestDataset</span>
                         <span id="dataset-count-badge" class="hidden ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
                             0 documents
                         </span>
@@ -200,14 +200,14 @@
         const chatMessages = document.getElementById('chat-messages');
         
         // State
-        let currentDataset = 'EU-Sanctions';
+        let currentDataset = 'TestDataset';
         let currentChatId = null;
         let folders = [];
         let chats = [];
         
         // Default datasets that can't be deleted
         const DEFAULT_DATASETS = [
-            {"name": "EU-Sanctions", "description": "European Union sanctions regulations and guidelines"},
+            {"name": "TestDataset", "description": "Default test dataset"},
             {"name": "US-Sanctions", "description": "United States sanctions regulations and guidelines"},
             {"name": "UN-Sanctions", "description": "United Nations sanctions regulations and guidelines"}
         ];
@@ -699,9 +699,9 @@
                     <div class="flex justify-center my-20">
                         <div class="text-center max-w-md">
                             <h3 class="text-xl font-bold mb-2">New Chat</h3>
-                            <p class="text-gray-600 mb-4">Ask questions about international sanctions regulations.</p>
+                            <p class="text-gray-600 mb-4">Ask questions about your dataset.</p>
                             <p class="text-sm text-gray-500">Using dataset: ${currentDataset}</p>
-                            <p class="text-xs text-gray-400">Powered by DeepSeek R1 Distill Llama 70B</p>
+                            <p class="text-xs text-gray-400">Powered by your favorite LLMs</p>
                         </div>
                     </div>
                 `;
@@ -840,7 +840,7 @@
                         <div class="flex justify-center my-20">
                             <div class="text-center max-w-md">
                                 <h3 class="text-xl font-bold mb-2">${chat.title || 'Untitled Chat'}</h3>
-                                <p class="text-gray-600 mb-4">Ask questions about international sanctions regulations.</p>
+                                <p class="text-gray-600 mb-4">Ask questions about the dataset.</p>
                                 <p class="text-sm text-gray-500">Using dataset: ${chat.dataset || currentDataset}</p>
                             </div>
                         </div>
@@ -1569,7 +1569,8 @@
                     // Create FormData for file upload
                     const uploadData = new FormData();
                     uploadData.append('dataset_name', datasetName);
-                    uploadData.append('dataset_description', formData.description);
+                    // If description is empty, send empty string to let backend generate a better one
+                    uploadData.append('dataset_description', formData.description || '');
                     uploadData.append('dataset_author', formData.author);
                     uploadData.append('dataset_topic', formData.topic);
                     uploadData.append('dataset_linkedin', formData.linkedin_url);
@@ -1660,7 +1661,9 @@
 
                         const result = await response.json();
                         showToast('Dataset updated successfully!');
-                        document.body.removeChild(modalOverlay);
+                        if (modalOverlay && modalOverlay.parentNode) {
+                            modalOverlay.parentNode.removeChild(modalOverlay);
+                        }
                         viewDatasets(); // Refresh the list
                     } catch (error) {
                         console.error('Error updating dataset:', error);
@@ -1978,7 +1981,10 @@
 
                         if (uploadComplete) {
                             showToast('Documents uploaded successfully!');
-                            document.body.removeChild(container.closest('.fixed'));
+                            const modalElement = container.closest('.fixed');
+                            if (modalElement && modalElement.parentNode) {
+                                modalElement.parentNode.removeChild(modalElement);
+                            }
                             viewDatasets(); // Refresh the list
                         } else {
                             throw new Error('Upload did not complete successfully');
@@ -2406,10 +2412,38 @@
                     }, 3000);
                     
                     if (currentDataset === datasetName) {
-                        currentDataset = DEFAULT_DATASETS[0].name;
-                        document.getElementById('current-dataset-indicator').textContent = currentDataset;
-                        document.getElementById('dataset-count-badge').classList.add('hidden');
-                        addMessage('assistant', `Switched to default dataset: ${currentDataset}`, null, false, true);
+                        // Fetch available datasets to find a replacement
+                        const datasetsResponse = await fetch('/api/datasets');
+                        const availableDatasets = await datasetsResponse.json();
+                        
+                        // Filter out the dataset being deleted
+                        const remainingDatasets = availableDatasets.filter(d => d.name !== datasetName);
+                        
+                        if (remainingDatasets.length > 0) {
+                            // Select the first available dataset
+                            currentDataset = remainingDatasets[0].name;
+                            document.getElementById('current-dataset-indicator').textContent = currentDataset;
+                            
+                            // Update count badge if it's a custom dataset
+                            const countBadge = document.getElementById('dataset-count-badge');
+                            if (remainingDatasets[0].is_custom && remainingDatasets[0].document_count !== undefined) {
+                                countBadge.textContent = `${remainingDatasets[0].document_count} documents`;
+                                countBadge.className = `ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                                    remainingDatasets[0].document_count === 0 ? 'bg-gray-100 text-gray-800' : 'bg-blue-100 text-blue-800'
+                                }`;
+                                countBadge.classList.remove('hidden');
+                            } else {
+                                countBadge.classList.add('hidden');
+                            }
+                            
+                            addMessage('assistant', `Dataset deleted. Switched to: ${currentDataset}`, null, false, true);
+                        } else {
+                            // No datasets left
+                            currentDataset = null;
+                            document.getElementById('current-dataset-indicator').textContent = 'No dataset selected';
+                            document.getElementById('dataset-count-badge').classList.add('hidden');
+                            addMessage('assistant', 'All datasets have been deleted. Please create a new dataset.', null, false, true);
+                        }
                     }
                 } else {
                     // Show error alert from server or a generic one

@@ -153,6 +153,8 @@ data/users/user_index.json
 
 # Development tools
 .claude/
+.claude/*
+!.claude/settings.json
 tools/
 
 # Documentation (development)
@@ -174,3 +176,11 @@ models/
 *.pt
 *.pth
 *.onnx
+
+# Migration and test files
+test_*.py
+*_migration.py
+supabasetasks.md
+
+# Local configuration
+.claude/settings.local.json

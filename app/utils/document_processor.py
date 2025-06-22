@@ -5,13 +5,19 @@ Utilities for processing legal documents and creating embeddings.
 import os
 from typing import List, Dict, Any, Tuple
 import uuid
+import ssl
+import urllib3
+import time
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from unstructured.partition.pdf import partition_pdf
 from unstructured.cleaners.core import clean_extra_whitespace
-import chromadb
 import torch
 from tqdm import tqdm
-from app.main import HNSW_CONFIG  # Import the HNSW configuration
+from app.utils.supabase_client import SupabaseVectorClient, SupabaseCollection
+
+# Disable SSL warnings and configure SSL context to handle SSL errors
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
 
 class LegalDocumentProcessor:
     """Processor for legal documents with specialized handling for legal terminology."""
@@ -19,14 +25,12 @@ class LegalDocumentProcessor:
     def __init__(
         self, 
         embedding_model: str, 
-        chroma_path: str,
         device: str = None
     ):
         """Initialize the document processor.
         
         Args:
             embedding_model: Name of the HuggingFace embedding model
-            chroma_path: Path to the Chroma DB
             device: Device to use for embeddings ('cuda' or 'cpu')
         """
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,15 +38,95 @@ class LegalDocumentProcessor:
             model_name=embedding_model,
             model_kwargs={"device": self.device}
         )
-        self.chroma_client = chromadb.PersistentClient(path=chroma_path)
+        
+        # Initialize Supabase client
+        try:
+            self.supabase_client = SupabaseVectorClient(use_service_key=True)
+        except Exception as e:
+            print(f"Warning: Could not connect to Supabase: {e}")
+            self.supabase_client = None
     
-    def process_document(self, file_path: str, chunk_size: int = 2000, chunk_overlap: int = 400) -> List[str]:
+    def _generate_embeddings_with_retry(self, texts: List[str], max_retries: int = 3) -> List[List[float]]:
+        """Generate embeddings with retry logic for SSL errors.
+        
+        Args:
+            texts: List of texts to embed
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            List of embedding vectors
+        """
+        for attempt in range(max_retries):
+            try:
+                # Try to generate embeddings
+                embeddings = self.embeddings.embed_documents(texts)
+                return embeddings
+            except (ssl.SSLError, Exception) as e:
+                if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        print(f"SSL error on attempt {attempt + 1}, retrying in {wait_time}s: {e}")
+                        time.sleep(wait_time)
+                        
+                        # Try to reinitialize the embeddings model
+                        try:
+                            self.embeddings = HuggingFaceEmbeddings(
+                                model_name=self.embeddings.model_name,
+                                model_kwargs={"device": self.device}
+                            )
+                        except Exception as reinit_e:
+                            print(f"Failed to reinitialize embeddings model: {reinit_e}")
+                    else:
+                        print(f"SSL error persists after {max_retries} attempts: {e}")
+                        raise
+                else:
+                    # Non-SSL error, raise immediately
+                    raise
+    
+    def _generate_query_embedding_with_retry(self, query: str, max_retries: int = 3) -> List[float]:
+        """Generate query embedding with retry logic for SSL errors.
+        
+        Args:
+            query: Query text to embed
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Query embedding vector
+        """
+        for attempt in range(max_retries):
+            try:
+                # Try to generate query embedding
+                embedding = self.embeddings.embed_query(query)
+                return embedding
+            except (ssl.SSLError, Exception) as e:
+                if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        print(f"SSL error on query attempt {attempt + 1}, retrying in {wait_time}s: {e}")
+                        time.sleep(wait_time)
+                        
+                        # Try to reinitialize the embeddings model
+                        try:
+                            self.embeddings = HuggingFaceEmbeddings(
+                                model_name=self.embeddings.model_name,
+                                model_kwargs={"device": self.device}
+                            )
+                        except Exception as reinit_e:
+                            print(f"Failed to reinitialize embeddings model: {reinit_e}")
+                    else:
+                        print(f"SSL error persists after {max_retries} attempts on query: {e}")
+                        raise
+                else:
+                    # Non-SSL error, raise immediately
+                    raise
+    
+    def process_document(self, file_path: str, chunk_size: int = 1024, chunk_overlap: int = 200) -> List[str]:
         """Process a single document and return chunked text.
         
         Args:
             file_path: Path to the document
-            chunk_size: Size of text chunks (increased from 1000 to 2000)
-            chunk_overlap: Overlap between chunks (increased from 200 to 400)
+            chunk_size: Size of text chunks (optimized for legal documents)
+            chunk_overlap: Overlap between chunks (20% of chunk size for context preservation)
             
         Returns:
             List of text chunks
@@ -355,11 +439,12 @@ class LegalDocumentProcessor:
         """
         import glob
         
-        # Create or get collection
-        collection = self.chroma_client.get_or_create_collection(
-            name=ragmodel_name,
-            hnsw_config=HNSW_CONFIG
-        )
+        # Create or get collection using Supabase
+        if self.supabase_client:
+            collection_data = self.supabase_client.get_or_create_collection(ragmodel_name)
+            collection = SupabaseCollection(self.supabase_client, ragmodel_name, collection_data)
+        else:
+            raise Exception("Supabase client not available for ragmodel creation")
         
         # Get list of PDF files
         file_paths = glob.glob(os.path.join(documents_dir, file_filter))
@@ -408,7 +493,7 @@ class LegalDocumentProcessor:
                     if len(chunk) < 100:  # Skip very short chunks
                         continue
                     
-                    chunk_id = f"{filename}_{i}_{uuid.uuid4()}"
+                    chunk_id = f"{filename}_{i}_{uuid.uuid4().hex[:8]}"
                     chunk_metadata = {
                         "source": filename,
                         "chunk_index": i,
@@ -481,13 +566,34 @@ class LegalDocumentProcessor:
                     batch_meta = metadatas[i:end_idx]
                     batch_ids = ids[i:end_idx]
                     
-                    # Generate embeddings using the embeddings model
-                    # In production, replace this with proper embedding generation
-                    collection.add(
-                        documents=batch_docs,
-                        metadatas=batch_meta,
-                        ids=batch_ids
-                    )
+                    # Generate embeddings using the embeddings model with SSL error handling
+                    try:
+                        # Generate embeddings for this batch with retry logic
+                        batch_embeddings = self._generate_embeddings_with_retry(batch_docs)
+                        
+                        collection.add(
+                            documents=batch_docs,
+                            embeddings=batch_embeddings,
+                            metadatas=batch_meta,
+                            ids=batch_ids
+                        )
+                    except (ssl.SSLError, Exception) as e:
+                        if "EOF occurred in violation of protocol" in str(e):
+                            print(f"SSL error encountered, retrying batch {i//batch_size + 1}: {e}")
+                            # Retry with smaller batch
+                            for doc, meta, doc_id in zip(batch_docs, batch_meta, batch_ids):
+                                try:
+                                    doc_embedding = self._generate_embeddings_with_retry([doc])
+                                    collection.add(
+                                        documents=[doc],
+                                        embeddings=doc_embedding,
+                                        metadatas=[meta],
+                                        ids=[doc_id]
+                                    )
+                                except Exception as retry_e:
+                                    print(f"Failed to add document {doc_id}: {retry_e}")
+                        else:
+                            raise e
                 
                 doc_count += 1
                 chunk_count += len(documents)
@@ -520,7 +626,12 @@ class LegalDocumentProcessor:
         # Import numpy for array operations
         import numpy as np
         
-        collection = self.chroma_client.get_collection(name=ragmodel_name)
+        # Get collection using Supabase
+        if self.supabase_client:
+            collection_data = self.supabase_client.get_collection(ragmodel_name)
+            collection = SupabaseCollection(self.supabase_client, ragmodel_name, collection_data)
+        else:
+            raise Exception("Supabase client not available for ragmodel query")
         
         # 1. Hybrid Search: Combine vector search with keyword search
         if use_hybrid_search:
@@ -612,16 +723,127 @@ class LegalDocumentProcessor:
         return results
 
     def query_dataset(self, dataset_name, query, n_results=5, use_hybrid_search=True, use_reranking=True, where=None):
-        """Query the Chroma collection for relevant documents and metadatas."""
-        collection = self.chroma_client.get_or_create_collection(name=dataset_name)
-        
-        # Use the advanced query_ragmodel function which has hybrid search and reranking
-        results = self.query_ragmodel(
-            ragmodel_name=dataset_name,
-            query=query,
-            n_results=n_results,
-            use_hybrid_search=use_hybrid_search,
-            use_reranking=use_reranking
-        )
-        
-        return results
+        """Query the Supabase collection for relevant documents and metadatas with enhanced retrieval."""
+        if self.supabase_client:
+            try:
+                # Generate query embedding with retry logic
+                query_embedding = self._generate_query_embedding_with_retry(query)
+                
+                if use_hybrid_search:
+                    # Step 1: Vector similarity search - get more results for reranking
+                    vector_results = self.supabase_client.query_collection(
+                        collection_name=dataset_name,
+                        query_embedding=query_embedding,
+                        n_results=min(n_results * 3, 30),  # Get 3x results for better reranking
+                        where=where
+                    )
+                    
+                    # Step 2: Keyword-based search using Supabase full-text search
+                    # Extract keywords from query
+                    import re
+                    keywords = [word.lower() for word in re.findall(r'\b\w+\b', query) 
+                               if len(word) > 3 and word.lower() not in {'what', 'when', 'where', 'which', 'that', 'this', 'from', 'with'}]
+                    
+                    # Initialize combined results
+                    all_documents = vector_results.get("documents", [[]])[0]
+                    all_metadatas = vector_results.get("metadatas", [[]])[0]
+                    all_distances = vector_results.get("distances", [[]])[0]
+                    all_ids = vector_results.get("ids", [[]])[0]
+                    seen_ids = set(all_ids)
+                    
+                    # Perform keyword search for each significant keyword
+                    for keyword in keywords[:3]:  # Limit to top 3 keywords
+                        try:
+                            # Search in document content using Supabase's text search
+                            keyword_results = self.supabase_client.search_documents_by_content(
+                                collection_name=dataset_name,
+                                search_text=keyword,
+                                n_results=10
+                            )
+                            
+                            # Merge keyword results with vector results
+                            if keyword_results and keyword_results.get("ids"):
+                                for i, doc_id in enumerate(keyword_results["ids"][0]):
+                                    if doc_id not in seen_ids:
+                                        all_ids.append(doc_id)
+                                        all_documents.append(keyword_results["documents"][0][i])
+                                        all_metadatas.append(keyword_results["metadatas"][0][i])
+                                        # Assign slightly worse distance for keyword matches
+                                        max_dist = max(all_distances) if all_distances else 1.0
+                                        all_distances.append(max_dist * 1.2)
+                                        seen_ids.add(doc_id)
+                        except Exception as e:
+                            print(f"Keyword search for '{keyword}' failed: {e}")
+                    
+                    # Prepare results for reranking
+                    results = {
+                        "documents": [all_documents],
+                        "metadatas": [all_metadatas],
+                        "distances": [all_distances],
+                        "ids": [all_ids]
+                    }
+                    
+                    # Step 3: Rerank results using semantic similarity
+                    if use_reranking and len(all_documents) > n_results:
+                        try:
+                            # Calculate semantic similarity scores for reranking
+                            import numpy as np
+                            
+                            # Generate embeddings for all retrieved documents
+                            doc_embeddings = self._generate_embeddings_with_retry(all_documents[:20])  # Limit to 20 for performance
+                            
+                            # Calculate cosine similarity between query and documents
+                            query_emb_array = np.array(query_embedding)
+                            doc_emb_array = np.array(doc_embeddings)
+                            
+                            # Compute cosine similarities
+                            similarities = np.dot(doc_emb_array, query_emb_array) / (
+                                np.linalg.norm(doc_emb_array, axis=1) * np.linalg.norm(query_emb_array)
+                            )
+                            
+                            # Get top n_results based on similarity
+                            top_indices = np.argsort(-similarities)[:n_results]
+                            
+                            # Reorder results
+                            results = {
+                                "documents": [[all_documents[i] for i in top_indices]],
+                                "metadatas": [[all_metadatas[i] for i in top_indices]],
+                                "distances": [[all_distances[i] for i in top_indices]],
+                                "ids": [[all_ids[i] for i in top_indices]]
+                            }
+                        except Exception as e:
+                            print(f"Reranking failed: {e}")
+                            # Fall back to truncating results
+                            results = {
+                                "documents": [all_documents[:n_results]],
+                                "metadatas": [all_metadatas[:n_results]],
+                                "distances": [all_distances[:n_results]],
+                                "ids": [all_ids[:n_results]]
+                            }
+                else:
+                    # Standard vector search only
+                    results = self.supabase_client.query_collection(
+                        collection_name=dataset_name,
+                        query_embedding=query_embedding,
+                        n_results=n_results,
+                        where=where
+                    )
+                
+                return results
+                
+            except Exception as e:
+                print(f"Error querying Supabase dataset {dataset_name}: {e}")
+                return {
+                    "documents": [[]],
+                    "metadatas": [[]],
+                    "distances": [[]],
+                    "ids": [[]]
+                }
+        else:
+            print("Supabase not available for query_dataset")
+            return {
+                "documents": [[]],
+                "metadatas": [[]],
+                "distances": [[]],
+                "ids": [[]]
+            }
