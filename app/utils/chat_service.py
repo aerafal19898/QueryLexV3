@@ -9,6 +9,7 @@ import time
 from typing import List, Dict, Any, Optional
 from supabase import create_client, Client
 from app.config import SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY
+from app.utils.connection_retry import retry_on_connection_error, safe_supabase_call
 
 
 class SupabaseChatService:
@@ -151,6 +152,7 @@ class SupabaseChatService:
         else:
             raise Exception(f"Failed to create chat: {result}")
     
+    @retry_on_connection_error(max_retries=3, backoff_factor=0.5)
     def get_chat(self, chat_id: str, include_messages: bool = True) -> Optional[Dict[str, Any]]:
         """Get chat by ID.
         
@@ -161,6 +163,11 @@ class SupabaseChatService:
         Returns:
             Chat data with messages or None if not found
         """
+        # Validate chat_id format
+        if not chat_id or chat_id == '[object Object]' or not isinstance(chat_id, str):
+            print(f"Invalid chat_id format: {chat_id}")
+            return None
+        
         # Get chat data
         result = self.client.table("chats").select("*").eq("id", chat_id).execute()
         
@@ -176,6 +183,7 @@ class SupabaseChatService:
         
         return chat
     
+    @retry_on_connection_error(max_retries=3, backoff_factor=0.5)
     def list_chats(self, folder_id: str = None) -> List[Dict[str, Any]]:
         """List chats, optionally filtered by folder.
         
@@ -247,6 +255,7 @@ class SupabaseChatService:
         return self.update_chat(chat_id, folder_id=folder_id)
     
     # Message Operations
+    @retry_on_connection_error(max_retries=3, backoff_factor=0.5)
     def add_message(self, chat_id: str, role: str, content: str, 
                    metadata: Dict[str, Any] = None, message_id: str = None) -> Dict[str, Any]:
         """Add a message to a chat.
@@ -281,6 +290,7 @@ class SupabaseChatService:
         else:
             raise Exception(f"Failed to add message: {result}")
     
+    @retry_on_connection_error(max_retries=3, backoff_factor=0.5)
     def get_messages(self, chat_id: str) -> List[Dict[str, Any]]:
         """Get all messages for a chat.
         

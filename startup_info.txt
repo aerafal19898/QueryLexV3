@@ -1,0 +1,31 @@
+QueryLexV4 Startup Information
+==============================
+
+If the application seems to hang during startup, here's what's happening:
+
+1. FIRST RUN (Takes 2-5 minutes):
+   - Downloading HuggingFace models (~1.3GB)
+   - Downloading NLTK data packages
+   - Initializing ML libraries (PyTorch, Transformers)
+
+2. SUBSEQUENT RUNS (Takes 30-60 seconds):
+   - Loading cached models from disk
+   - Initializing ML libraries
+
+3. COMMON HANG POINTS:
+   - "[MAIN] Importing HuggingFace and ML libraries..." (30-60 seconds)
+   - "[EMBEDDINGS] Loading model..." (First run: 2-5 minutes)
+   - "[MAIN] Downloading NLTK data..." (First run: 30 seconds)
+
+4. WHAT'S BEING DOWNLOADED:
+   - BAAI/bge-large-en-v1.5 embedding model (~1.3GB)
+   - NLTK language data packages (~50MB)
+   - PyTorch model dependencies
+
+5. TROUBLESHOOTING:
+   - Ensure stable internet connection
+   - Check available disk space (need ~2GB free)
+   - Wait patiently on first run
+   - Check Windows Defender/antivirus isn't blocking downloads
+
+The application will show clear progress messages and a "Ready to serve requests" message when fully loaded.

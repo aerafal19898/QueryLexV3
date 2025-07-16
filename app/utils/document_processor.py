@@ -9,8 +9,7 @@ import ssl
 import urllib3
 import time
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from unstructured.partition.pdf import partition_pdf
-from unstructured.cleaners.core import clean_extra_whitespace
+# Lazy import for document processing libraries to avoid startup issues
 import torch
 from tqdm import tqdm
 from app.utils.supabase_client import SupabaseVectorClient, SupabaseCollection
@@ -134,8 +133,14 @@ class LegalDocumentProcessor:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
         
+        # Get document processing libraries from main module
+        from app.main import get_document_processing_libs
+        partition_pdf_func, _ = get_document_processing_libs()
+        if partition_pdf_func is None:
+            raise ImportError("unstructured library not available")
+        
         # Extract text from PDF using unstructured
-        elements = partition_pdf(
+        elements = partition_pdf_func(
             file_path,
             strategy="hi_res",
             infer_table_structure=True
@@ -147,6 +152,14 @@ class LegalDocumentProcessor:
             if hasattr(element, 'text'):
                 text = element.text
                 if text:
+                    # Import cleaner (should be loaded at startup)
+                    try:
+                        from unstructured.cleaners.core import clean_extra_whitespace
+                    except ImportError:
+                        # If cleaner not available, use basic cleanup
+                        def clean_extra_whitespace(text):
+                            return ' '.join(text.split())
+                    
                     # Clean text
                     text = clean_extra_whitespace(text)
                     texts.append(text)

@@ -2,48 +2,94 @@
 Main application file for the Legal Sanctions RAG system.
 """
 
+print("[MAIN] Starting imports...")
+
+print("[MAIN] Importing Flask and core dependencies...")
 from flask import Flask, render_template, request, jsonify, session, after_this_request, g, redirect, url_for, Response, stream_with_context
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt_identity, verify_jwt_in_request, decode_token
 from functools import wraps
 import os
-from app.utils.supabase_client import SupabaseVectorClient, SupabaseCollection
 import uuid
 import time
 import re
 import json
 from werkzeug.utils import secure_filename
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from transformers import pipeline
-import torch
-from unstructured.partition.pdf import partition_pdf
-import dotenv
 from datetime import datetime
-import nltk
-import PyPDF2
 import io
 import tempfile
 import secrets
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tesseract_config import configure_tesseract
+
+print("[MAIN] Importing document processing libraries...")
+print("[MAIN] This may take a moment as some libraries are large...")
+
+print("[MAIN] Importing HuggingFace and ML libraries...")
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from transformers import pipeline
+import torch
+
+print("[MAIN] Document processing libraries will be imported when needed...")
+
+print("[MAIN] Importing NLTK...")
+import nltk
+
+print("[MAIN] Importing environment and utility libraries...")
+import dotenv
+from app.utils.supabase_client import SupabaseVectorClient, SupabaseCollection
+print("[MAIN] Importing pytesseract (OCR library)...")
 try:
     import pytesseract
+    import platform
+    
+    # Configure Tesseract path for Windows
+    if platform.system() == "Windows":
+        # Check common Windows installation paths
+        tesseract_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            r"C:\Users\andri\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+        ]
+        
+        for path in tesseract_paths:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                print(f"[MAIN] Tesseract found at: {path}")
+                break
+        else:
+            print("[MAIN] Warning: Tesseract not found in common Windows paths")
+            print("[MAIN] OCR features may not work. Install from: https://github.com/UB-Mannheim/tesseract/wiki")
+    
     PYTESSERACT_AVAILABLE = True
+    print("[MAIN] pytesseract imported successfully")
 except ImportError:
     PYTESSERACT_AVAILABLE = False
+    print("[MAIN] pytesseract not available (optional)")
 
 # Load environment variables
+print("[MAIN] Loading environment variables...")
 dotenv.load_dotenv()
 
+# Configure Tesseract for Windows
+print("[MAIN] Configuring Tesseract OCR...")
+configure_tesseract()
+
 # Download necessary NLTK data
+print("[MAIN] Downloading NLTK data (this may take a moment on first run)...")
 try:
     nltk.download('punkt', quiet=True)
     nltk.download('averaged_perceptron_tagger', quiet=True)
     # For English only
     nltk.download('maxent_ne_chunker', quiet=True)
     nltk.download('words', quiet=True)
+    print("[MAIN] NLTK data downloaded successfully")
 except Exception as e:
-    print(f"Warning: NLTK download error: {str(e)}")
+    print(f"[MAIN] Warning: NLTK download error: {str(e)}")
 
 # Local imports
+print("[MAIN] Importing application configuration...")
 from app.config import (
     DOCUMENTS_DIR, 
     EMBEDDING_MODEL,
@@ -59,24 +105,29 @@ from app.config import (
     SUPABASE_ANON_KEY,
     SUPABASE_SERVICE_KEY
 )
+
+print("[MAIN] Importing utility services...")
 from app.utils.openrouter_client import OpenRouterClient
 from app.utils.chat_service import SupabaseChatService
 
+print("[MAIN] All imports completed successfully!")
+
+print("[MAIN] Creating Flask app...")
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 # Configure session to be permanent and last for 31 days
 app.config['PERMANENT_SESSION_LIFETIME'] = 60 * 60 * 24 * 31  # 31 days in seconds
 CORS(app)
+print("[MAIN] Flask app created successfully")
 
 # Initialize Supabase Vector Client
+print("[MAIN] Initializing Supabase client...")
 try:
     supabase_client = SupabaseVectorClient(use_service_key=True)
-    print("Successfully connected to Supabase")
+    print("[MAIN] Successfully connected to Supabase")
 except Exception as e:
-    print(f"Warning: Could not connect to Supabase: {e}")
-    print("Falling back to local mode")
+    print(f"[MAIN] Warning: Could not connect to Supabase: {e}")
     supabase_client = None
-
 
 # Configure SSL for HuggingFace embeddings
 import ssl
@@ -84,29 +135,204 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# Initialize embeddings
-embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+# Initialize embeddings lazily (only when needed)
+print(f"[MAIN] Setting up lazy embeddings initialization with model: {EMBEDDING_MODEL}")
+embeddings = None  # Will be initialized when first needed
+
+# Document processing libraries - background preloading with health checks
+print("[MAIN] Document processing libraries will be loaded in background after startup")
+partition_pdf = None
+PyPDF2 = None
+doc_processing_status = {
+    'initialized': False,
+    'loading': False,
+    'error': None,
+    'progress': 'Not started',
+    'libraries': {
+        'unstructured': {'loaded': False, 'error': None},
+        'PyPDF2': {'loaded': False, 'error': None},
+        'pdf2image': {'loaded': False, 'error': None},
+        'pytesseract': {'loaded': False, 'error': None},
+        'cleaners': {'loaded': False, 'error': None}
+    }
+}
+
+def load_document_processing_libraries():
+    """Load document processing libraries in background thread."""
+    global partition_pdf, PyPDF2, doc_processing_status
+    
+    doc_processing_status['loading'] = True
+    doc_processing_status['progress'] = 'Starting library loading...'
+    
+    try:
+        # Load unstructured library (after fixing Python version)
+        doc_processing_status['progress'] = 'Loading unstructured library...'
+        print("[BACKGROUND] Loading unstructured library...")
+        try:
+            from unstructured.partition.pdf import partition_pdf as _partition_pdf
+            partition_pdf = _partition_pdf
+            doc_processing_status['libraries']['unstructured']['loaded'] = True
+            print("[BACKGROUND] ✓ Unstructured library loaded successfully")
+        except Exception as e:
+            error_msg = f"Failed to load unstructured library: {e}"
+            doc_processing_status['libraries']['unstructured']['error'] = error_msg
+            print(f"[BACKGROUND] ✗ {error_msg}")
+            partition_pdf = None
+        
+        # Load PyPDF2 as fallback
+        doc_processing_status['progress'] = 'Loading PyPDF2...'
+        print("[BACKGROUND] Loading PyPDF2...")
+        try:
+            import PyPDF2 as _PyPDF2
+            PyPDF2 = _PyPDF2
+            doc_processing_status['libraries']['PyPDF2']['loaded'] = True
+            print("[BACKGROUND] ✓ PyPDF2 loaded successfully")
+        except Exception as e:
+            error_msg = f"Failed to load PyPDF2: {e}"
+            doc_processing_status['libraries']['PyPDF2']['error'] = error_msg
+            print(f"[BACKGROUND] ✗ {error_msg}")
+            PyPDF2 = None
+        
+        # Load PDF processing dependencies
+        doc_processing_status['progress'] = 'Loading PDF processing dependencies...'
+        print("[BACKGROUND] Loading PDF processing dependencies...")
+        try:
+            import pdf2image
+            import pytesseract
+            import platform
+            
+            # Configure Tesseract path for Windows
+            if platform.system() == "Windows":
+                tesseract_paths = [
+                    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                    r"C:\Users\andri\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+                ]
+                
+                for path in tesseract_paths:
+                    if os.path.exists(path):
+                        pytesseract.pytesseract.tesseract_cmd = path
+                        # Also set environment variable for unstructured
+                        os.environ['TESSERACT_PATH'] = path
+                        print(f"[BACKGROUND] Tesseract configured at: {path}")
+                        break
+            
+            doc_processing_status['libraries']['pdf2image']['loaded'] = True
+            doc_processing_status['libraries']['pytesseract']['loaded'] = True
+            print("[BACKGROUND] ✓ PDF processing dependencies loaded successfully")
+        except Exception as e:
+            error_msg = f"Failed to load PDF processing dependencies: {e}"
+            doc_processing_status['libraries']['pdf2image']['error'] = error_msg
+            doc_processing_status['libraries']['pytesseract']['error'] = error_msg
+            print(f"[BACKGROUND] ✗ {error_msg}")
+        
+        # Load cleaners
+        doc_processing_status['progress'] = 'Loading unstructured cleaners...'
+        print("[BACKGROUND] Loading unstructured cleaners...")
+        try:
+            from unstructured.cleaners.core import clean_extra_whitespace
+            doc_processing_status['libraries']['cleaners']['loaded'] = True
+            print("[BACKGROUND] ✓ Unstructured cleaners loaded successfully")
+        except Exception as e:
+            error_msg = f"Failed to load unstructured cleaners: {e}"
+            doc_processing_status['libraries']['cleaners']['error'] = error_msg
+            print(f"[BACKGROUND] ✗ {error_msg}")
+        
+        # Check if we have at least one working library
+        if partition_pdf is not None or PyPDF2 is not None:
+            doc_processing_status['initialized'] = True
+            doc_processing_status['progress'] = 'Document processing libraries ready'
+            print("[BACKGROUND] Document processing libraries initialization complete")
+        else:
+            doc_processing_status['error'] = "No document processing libraries could be loaded"
+            doc_processing_status['progress'] = 'Failed to load any document processing libraries'
+            print("[BACKGROUND] ✗ Failed to load any document processing libraries")
+        
+    except Exception as e:
+        doc_processing_status['error'] = f"Background loading failed: {e}"
+        doc_processing_status['progress'] = f'Background loading failed: {e}'
+        print(f"[BACKGROUND] ✗ Background loading failed: {e}")
+    
+    finally:
+        doc_processing_status['loading'] = False
+
+def get_document_processing_libs():
+    """Get document processing libraries with status checking."""
+    global partition_pdf, PyPDF2, doc_processing_status
+    
+    return partition_pdf, PyPDF2
+
+def get_embeddings():
+    """Get embeddings instance, initializing if needed."""
+    global embeddings
+    if embeddings is None:
+        print(f"[EMBEDDINGS] Initializing HuggingFace embeddings with model: {EMBEDDING_MODEL}...")
+        print("[EMBEDDINGS] NOTE: This may take a few minutes on first run.")
+        print("[EMBEDDINGS] If this is the first time running, the model will be downloaded...")
+        print("[EMBEDDINGS] Download progress is not shown, but the process is running...")
+        print("[EMBEDDINGS] Please wait, this can take 2-5 minutes depending on your internet connection...")
+        print("[EMBEDDINGS] Model size: ~1.3GB for BAAI/bge-large-en-v1.5")
+        print("[EMBEDDINGS] Progress: Starting download/initialization...")
+        
+        # Document processing libraries are loaded separately when needed
+        
+        import time
+        import threading
+        import sys
+        
+        # Progress indicator
+        def progress_indicator():
+            chars = "|/-\\"
+            idx = 0
+            while not stop_progress:
+                print(f"\r[EMBEDDINGS] Loading model... {chars[idx % len(chars)]}", end='', flush=True)
+                time.sleep(0.2)
+                idx += 1
+        
+        stop_progress = False
+        progress_thread = threading.Thread(target=progress_indicator)
+        progress_thread.daemon = True
+        progress_thread.start()
+        
+        start_time = time.time()
+        try:
+            embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+        finally:
+            stop_progress = True
+            progress_thread.join(timeout=1)
+        
+        end_time = time.time()
+        print(f"\r[EMBEDDINGS] Embeddings initialized successfully in {end_time - start_time:.2f} seconds")
+    return embeddings
+
+print("[MAIN] Embeddings will be initialized on first use")
 
 # Direct use of Supabase client - no wrapper functions needed
 
 # Initialize the OpenRouter client with the new DeepSeek model
-print(f"Using OpenRouter with model: deepseek/deepseek-chat-v3-0324:free")
+print(f"[MAIN] Initializing OpenRouter client with model: deepseek/deepseek-chat-v3-0324:free")
 llm_client = OpenRouterClient(
     api_key=OPENROUTER_API_KEY, 
     api_base=OPENROUTER_API_BASE,
     model="deepseek/deepseek-chat-v3-0324:free"
 )
+print("[MAIN] OpenRouter client initialized")
 
 # Check for GPU
+print("[MAIN] Checking for GPU availability...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"[MAIN] Using device: {device}")
 
 # Initialize JWT manager for authentication
+print("[MAIN] Initializing JWT manager...")
 jwt = JWTManager(app)
 app.config['JWT_SECRET_KEY'] = os.environ.get("JWT_SECRET_KEY", SECRET_KEY)
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = int(os.environ.get("JWT_ACCESS_TOKEN_EXPIRES", 60 * 60))  # 1 hour
 app.config['JWT_REFRESH_TOKEN_EXPIRES'] = int(os.environ.get("JWT_REFRESH_TOKEN_EXPIRES", 60 * 60 * 24 * 30))  # 30 days
+print("[MAIN] JWT manager configured")
 
 # Import and initialize additional components
+print("[MAIN] Importing additional utility components...")
 from app.models.user import User
 from app.utils.audit_logger import AuditLogger
 from app.utils.feedback_service import SupabaseFeedbackService
@@ -115,6 +341,7 @@ from app.utils.encryption import DocumentEncryption
 from app.utils.secure_processor import SecureDocumentProcessor
 
 # Initialize user management
+print("[MAIN] Initializing user management...")
 user_manager = User()
 
 # Initialize audit logger
@@ -186,7 +413,9 @@ def initialize_default_dataset():
         DEFAULT_DATASET_NAME = None
 
 # Initialize default dataset
+print("[MAIN] Initializing default dataset...")
 initialize_default_dataset()
+print("[MAIN] Default dataset initialization complete")
 
 # Define base directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -241,26 +470,67 @@ def format_response_with_bold_headers(response):
 
 def robust_extract_text_from_pdf(pdf_path):
     """Extract text from PDF using multiple methods for better reliability."""
+    global doc_processing_status
+    
     # Store all extracted text
     all_text = []
     extraction_success = False
     
+    # Check if libraries are still loading
+    if doc_processing_status['loading']:
+        print(f"[DOC_PROCESSING] Libraries still loading: {doc_processing_status['progress']}")
+        print(f"[DOC_PROCESSING] Waiting for background loading to complete...")
+        # Wait a reasonable amount of time for background loading
+        import time
+        max_wait = 300  # 5 minutes maximum wait
+        wait_time = 0
+        while doc_processing_status['loading'] and wait_time < max_wait:
+            time.sleep(5)
+            wait_time += 5
+            print(f"[DOC_PROCESSING] Still waiting... ({wait_time}s elapsed, status: {doc_processing_status['progress']})")
+        
+        if doc_processing_status['loading']:
+            print(f"[DOC_PROCESSING] Timeout waiting for libraries to load. Proceeding with available libraries.")
+    
+    # Get document processing libraries
+    partition_pdf_func, PyPDF2_lib = get_document_processing_libs()
+    
     # METHOD 1: Using unstructured library (works well for many PDFs)
-    try:
-        print(f"Trying unstructured partition for {pdf_path}")
-        # Try without extract_images_in_pdf parameter first
+    if partition_pdf_func is not None:
         try:
-            elements = partition_pdf(pdf_path, strategy="hi_res")
-        except TypeError:
-            # If that fails, try with older version parameters
-            elements = partition_pdf(pdf_path)
+            print(f"Trying unstructured partition for {pdf_path}")
             
-        for element in elements:
-            if hasattr(element, 'text') and element.text:
-                all_text.append(element.text)
-                extraction_success = True
-    except Exception as e:
-        print(f"Error with unstructured partition: {str(e)}")
+            # Ensure Tesseract is configured for Windows
+            import platform
+            if platform.system() == "Windows" and 'TESSERACT_PATH' not in os.environ:
+                tesseract_paths = [
+                    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                    r"C:\Users\andri\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+                ]
+                for path in tesseract_paths:
+                    if os.path.exists(path):
+                        os.environ['TESSERACT_PATH'] = path
+                        if PYTESSERACT_AVAILABLE:
+                            pytesseract.pytesseract.tesseract_cmd = path
+                        print(f"[EXTRACT] Tesseract configured at: {path}")
+                        break
+            
+            # Try without extract_images_in_pdf parameter first
+            try:
+                elements = partition_pdf_func(pdf_path, strategy="hi_res")
+            except TypeError:
+                # If that fails, try with older version parameters
+                elements = partition_pdf_func(pdf_path)
+                
+            for element in elements:
+                if hasattr(element, 'text') and element.text:
+                    all_text.append(element.text)
+                    extraction_success = True
+        except Exception as e:
+            print(f"Error with unstructured partition: {str(e)}")
+    else:
+        print(f"[DOC_PROCESSING] Unstructured library not available, skipping to PyPDF2")
     
     # If first method got text, return it
     if extraction_success and len(''.join(all_text).strip()) > 100:
@@ -268,25 +538,35 @@ def robust_extract_text_from_pdf(pdf_path):
         return all_text
     
     # METHOD 2: Using PyPDF2 (good for text-based PDFs)
-    try:
-        print(f"Trying PyPDF2 for {pdf_path}")
-        pdf_text = []
-        with open(pdf_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            if len(pdf_reader.pages) > 0:
-                for page_num in range(len(pdf_reader.pages)):
-                    page = pdf_reader.pages[page_num]
-                    text = page.extract_text()
-                    if text and text.strip():
-                        pdf_text.append(f"Page {page_num+1}: {text}")
-                        extraction_success = True
-        
-        # If we got text, add it to all_text
-        if extraction_success:
-            all_text.extend(pdf_text)
-            print(f"Successfully extracted text using PyPDF2")
-    except Exception as e:
-        print(f"Error with PyPDF2: {str(e)}")
+    if PyPDF2_lib is not None:
+        try:
+            print(f"Trying PyPDF2 for {pdf_path}")
+            
+            pdf_text = []
+            with open(pdf_path, 'rb') as file:
+                pdf_reader = PyPDF2_lib.PdfReader(file)
+                if len(pdf_reader.pages) > 0:
+                    for page_num in range(len(pdf_reader.pages)):
+                        page = pdf_reader.pages[page_num]
+                        text = page.extract_text()
+                        if text and text.strip():
+                            pdf_text.append(f"Page {page_num+1}: {text}")
+                            extraction_success = True
+            
+            # If we got text, add it to all_text
+            if extraction_success:
+                all_text.extend(pdf_text)
+                print(f"Successfully extracted text using PyPDF2")
+        except Exception as e:
+            print(f"Error with PyPDF2: {str(e)}")
+    else:
+        print(f"[DOC_PROCESSING] PyPDF2 library not available, skipping to OCR")
+    
+    # If we still don't have text and neither library is available, provide clear error
+    if not extraction_success and partition_pdf_func is None and PyPDF2_lib is None:
+        print(f"[DOC_PROCESSING] ERROR: No PDF processing libraries are available!")
+        print(f"[DOC_PROCESSING] Library status: {doc_processing_status}")
+        return []
     
     # METHOD 3: Using OCR if available and needed
     if not extraction_success and PYTESSERACT_AVAILABLE:
@@ -315,6 +595,12 @@ def robust_extract_text_from_pdf(pdf_path):
         return []
     
     return all_text
+
+@app.route('/api/health/document-processing')
+def health_check():
+    """Check the status of document processing library loading."""
+    global doc_processing_status
+    return jsonify(doc_processing_status)
 
 @app.route('/')
 def index():
@@ -406,7 +692,7 @@ def chat():
             }
         else:
             # Query the collection directly using embeddings
-            query_embedding = embeddings.embed_query(user_message)
+            query_embedding = get_embeddings().embed_query(user_message)
             results = collection.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results
@@ -847,7 +1133,7 @@ def process_documents():
         
         # Generate embeddings for the batch with SSL error handling
         try:
-            batch_embeddings = embeddings.embed_documents(batch_docs)
+            batch_embeddings = get_embeddings().embed_documents(batch_docs)
         except Exception as e:
             if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
                 print(f"SSL error generating embeddings, retrying individually with delay: {e}")
@@ -857,7 +1143,7 @@ def process_documents():
                     for attempt in range(max_retries):
                         try:
                             time.sleep(1)  # Wait 1 second between attempts
-                            doc_embedding = embeddings.embed_documents([doc])
+                            doc_embedding = get_embeddings().embed_documents([doc])
                             batch_embeddings.extend(doc_embedding)
                             break
                         except Exception as retry_e:
@@ -998,7 +1284,7 @@ def upload_documents():
                 
                 # Generate embeddings for the batch with SSL error handling
                 try:
-                    batch_embeddings = embeddings.embed_documents(batch_docs)
+                    batch_embeddings = get_embeddings().embed_documents(batch_docs)
                 except Exception as e:
                     if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
                         print(f"SSL error generating embeddings, retrying individually with delay: {e}")
@@ -1008,7 +1294,7 @@ def upload_documents():
                             for attempt in range(max_retries):
                                 try:
                                     time.sleep(1)  # Wait 1 second between attempts
-                                    doc_embedding = embeddings.embed_documents([doc])
+                                    doc_embedding = get_embeddings().embed_documents([doc])
                                     batch_embeddings.extend(doc_embedding)
                                     break
                                 except Exception as retry_e:
@@ -1064,18 +1350,26 @@ def upload_documents():
 @app.route('/api/folders', methods=['GET'])
 def list_folders_route():
     """List all folders."""
-    folders = chat_storage.list_folders()
-    return jsonify(folders)
+    try:
+        folders = chat_storage.list_folders()
+        return jsonify(folders)
+    except Exception as e:
+        print(f"Error listing folders: {e}")
+        return jsonify([])
 
 @app.route('/api/folders', methods=['POST'])
 def create_folder_route():
     """Create a new folder."""
-    data = request.json
-    name = data.get('name', '').strip()
-    if not name:
-        return jsonify({'error': 'Missing folder name'}), 400
-    folder_id = chat_storage.create_folder(name)
-    return jsonify({'success': True, 'id': folder_id, 'name': name})
+    try:
+        data = request.json
+        name = data.get('name', '').strip()
+        if not name:
+            return jsonify({'error': 'Missing folder name'}), 400
+        folder_id = chat_storage.create_folder(name)
+        return jsonify({'success': True, 'id': folder_id, 'name': name})
+    except Exception as e:
+        print(f"Error creating folder: {e}")
+        return jsonify({'error': 'Failed to create folder'}), 500
 
 @app.route('/api/folders/<folder_id>', methods=['PUT'])
 def rename_folder_route(folder_id):
@@ -1115,8 +1409,12 @@ def delete_folder_route(folder_id):
 @app.route('/api/chats', methods=['GET'])
 def list_chats():
     """List all chats with message counts and proper timestamps."""
-    folder_id = request.args.get('folder_id')
-    chats = chat_storage.list_chats(folder_id)
+    try:
+        folder_id = request.args.get('folder_id')
+        chats = chat_storage.list_chats(folder_id)
+    except Exception as e:
+        print(f"Error listing chats: {e}")
+        return jsonify([])
     
     # Enhance each chat with message count and format timestamps
     enhanced_chats = []
@@ -1167,14 +1465,18 @@ def list_chats():
 @app.route('/api/chats', methods=['POST'])
 def create_chat():
     """Create a new chat."""
-    data = request.json
-    title = data.get('title')
-    folder_id = data.get('folder_id', 'default')
-    dataset = data.get('dataset', DEFAULT_DATASET_NAME)
-    
-    chat_data = chat_storage.create_chat(title, folder_id, dataset)
-    
-    return jsonify({"id": chat_data["id"]})
+    try:
+        data = request.json
+        title = data.get('title')
+        folder_id = data.get('folder_id', 'default')
+        dataset = data.get('dataset', DEFAULT_DATASET_NAME)
+        
+        chat_data = chat_storage.create_chat(title, folder_id, dataset)
+        
+        return jsonify({"id": chat_data["id"]})
+    except Exception as e:
+        print(f"Error creating chat: {e}")
+        return jsonify({"error": "Failed to create chat"}), 500
 
 @app.route('/api/chats/<chat_id>/move', methods=['POST'])
 def move_chat_to_folder_route(chat_id):
@@ -1200,9 +1502,17 @@ def move_chat_to_folder_route(chat_id):
 @app.route('/api/chats/<chat_id>', methods=['GET'])
 def get_chat(chat_id):
     """Get a chat by ID."""
-    chat = chat_storage.get_chat(chat_id)
-    if chat is None:
-        return jsonify({"error": "Chat not found"}), 404
+    # Validate chat_id format
+    if not chat_id or chat_id == '[object Object]' or chat_id == 'undefined':
+        return jsonify({"error": "Invalid chat ID format"}), 400
+    
+    try:
+        chat = chat_storage.get_chat(chat_id)
+        if chat is None:
+            return jsonify({"error": "Chat not found"}), 404
+    except Exception as e:
+        print(f"Error getting chat {chat_id}: {e}")
+        return jsonify({"error": "Failed to retrieve chat. Please try again."}), 500
     
     # Validate and sanitize messages to ensure they're correctly formatted
     if 'messages' in chat:
@@ -2241,7 +2551,7 @@ def upload_documents_to_dataset(dataset_name):
                 
                 # Generate embeddings for the batch with SSL error handling
                 try:
-                    batch_embeddings = embeddings.embed_documents(batch_docs)
+                    batch_embeddings = get_embeddings().embed_documents(batch_docs)
                 except Exception as e:
                     if "EOF occurred in violation of protocol" in str(e) or "SSL" in str(e):
                         print(f"SSL error generating embeddings, retrying individually with delay: {e}")
@@ -2251,7 +2561,7 @@ def upload_documents_to_dataset(dataset_name):
                             for attempt in range(max_retries):
                                 try:
                                     time.sleep(1)  # Wait 1 second between attempts
-                                    doc_embedding = embeddings.embed_documents([doc])
+                                    doc_embedding = get_embeddings().embed_documents([doc])
                                     batch_embeddings.extend(doc_embedding)
                                     break
                                 except Exception as retry_e:
@@ -2474,5 +2784,17 @@ def finalize_message(chat_id: str, content: str) -> None:
     except Exception as e:
         print(f"Error finalizing message: {str(e)}")
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+# Start background thread to load document processing libraries
+print("[MAIN] Starting background thread for document processing libraries...")
+import threading
+background_thread = threading.Thread(target=load_document_processing_libraries, daemon=True)
+background_thread.start()
+print("[MAIN] Background thread started. Libraries will load while app serves requests.")
+print("[MAIN] Check /api/health/document-processing for loading status.")
+
+# Note: The application is started from run.py, not from this file directly
+print("[MAIN] ============================================")
+print("[MAIN] QueryLexV4 application fully loaded!")
+print("[MAIN] ============================================")
+print("[MAIN] Ready to serve requests.")
+print("[MAIN] The app is now ready to start!")

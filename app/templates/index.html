@@ -143,7 +143,7 @@
                 <div class="flex items-center space-x-4">
                     <div class="text-sm text-gray-600 flex items-center">
                         Dataset: 
-                        <span id="current-dataset-indicator" class="font-semibold text-blue-700 mx-1">TestDataset</span>
+                        <span id="current-dataset-indicator" class="font-semibold text-blue-700 mx-1">Loading...</span>
                         <span id="dataset-count-badge" class="hidden ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
                             0 documents
                         </span>
@@ -200,7 +200,7 @@
         const chatMessages = document.getElementById('chat-messages');
         
         // State
-        let currentDataset = 'TestDataset';
+        let currentDataset = null; // Will be set by validateAndSelectDataset()
         let currentChatId = null;
         let folders = [];
         let chats = [];
@@ -221,13 +221,61 @@
         // Get the last active chat ID from the server (if it exists)
         const lastActiveChatId = '{{ last_active_chat|default("None") }}' !== 'None' ? '{{ last_active_chat|default("None") }}' : null;
         
+        // Function to validate and ensure a dataset is selected
+        async function validateAndSelectDataset() {
+            try {
+                // Fetch available datasets
+                const response = await fetch('/api/datasets');
+                const datasets = await response.json();
+                
+                if (!datasets || datasets.length === 0) {
+                    // No datasets available
+                    currentDataset = null;
+                    document.getElementById('current-dataset-indicator').textContent = 'No datasets available';
+                    document.getElementById('dataset-count-badge').classList.add('hidden');
+                    return false;
+                }
+                
+                // Check if current dataset exists in available datasets
+                const currentExists = datasets.some(d => d.name === currentDataset);
+                
+                if (!currentExists) {
+                    // Current dataset doesn't exist, select the first available one
+                    currentDataset = datasets[0].name;
+                    document.getElementById('current-dataset-indicator').textContent = currentDataset;
+                    
+                    // Update count badge if needed
+                    const countBadge = document.getElementById('dataset-count-badge');
+                    if (datasets[0].is_custom && datasets[0].document_count !== undefined) {
+                        countBadge.textContent = `${datasets[0].document_count} documents`;
+                        countBadge.className = `ml-2 inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                            datasets[0].document_count > 0 ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'
+                        }`;
+                        countBadge.classList.remove('hidden');
+                    } else {
+                        countBadge.classList.add('hidden');
+                    }
+                    
+                    console.log(`Dataset '${currentDataset}' not found, auto-selected: ${datasets[0].name}`);
+                }
+                
+                return true;
+            } catch (error) {
+                console.error('Error validating dataset:', error);
+                return false;
+            }
+        }
+        
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
             // Hide rename button initially (will show when a chat is selected)
             document.getElementById('rename-chat-btn').style.display = 'none';
             
-            await loadFolders();
-            await loadChats();
+            // Validate dataset selection first
+            await validateAndSelectDataset();
+            
+            // Load folders and chats in parallel for faster initialization
+            await Promise.all([loadFolders(), loadChats()]);
             
             // If we have a last active chat, try to load it
             if (lastActiveChatId) {
@@ -360,6 +408,8 @@
                     if (done) {
                         // After streaming completes, fetch the full message details to get context/sources
                         // The backend's finalize_message should have updated the chat storage
+                        // Update cache after streaming completes
+                        chatCache.delete(currentChatId); // Clear cache to force reload with new message
                         await loadChat(currentChatId); // This will re-render the chat with the final message from storage
                         // The placeholder streaming-message-xxxx div will be removed when loadChat clears messages.
                         break;
@@ -722,7 +772,7 @@
                 currentChatId = data.id;
                 currentChatTitle.textContent = 'New Chat';
                 
-                // Save the newly created chat as the last active chat
+                // Save the newly created chat as the last active chat (async, don't wait)
                 fetch('/api/save-last-chat', {
                     method: 'POST',
                     headers: {
@@ -733,18 +783,50 @@
                     }),
                 }).catch(err => console.error('Error saving last chat:', err));
                 
-                // Reload chats
-                await loadChats();
+                // Reload chats in background (don't wait)
+                loadChats().catch(err => console.error('Error reloading chats:', err));
             } catch (error) {
                 console.error('Error creating chat:', error);
             }
         }
         
+        // Cache for loaded chats to avoid repeated fetches
+        const chatCache = new Map();
+        
         async function loadChat(chatId) {
             try {
-                // Get chat data
-                const response = await fetch(`/api/chats/${chatId}`);
-                const chat = await response.json();
+                // Validate chatId
+                if (!chatId || typeof chatId !== 'string' || chatId === '[object Object]' || chatId === 'undefined') {
+                    console.error('Invalid chatId:', chatId);
+                    return;
+                }
+                
+                // Check if we already have this chat and it's the current one
+                if (currentChatId === chatId && chatCache.has(chatId)) {
+                    return; // Already loaded, no need to reload
+                }
+                
+                let chat;
+                // Check cache first
+                if (chatCache.has(chatId)) {
+                    chat = chatCache.get(chatId);
+                } else {
+                    // Get chat data from server
+                    const response = await fetch(`/api/chats/${chatId}`);
+                    
+                    if (!response.ok) {
+                        const error = await response.json();
+                        console.error('Error loading chat:', error);
+                        if (response.status === 400) {
+                            console.error('Invalid chat ID format');
+                        }
+                        return;
+                    }
+                    
+                    chat = await response.json();
+                    // Cache the chat
+                    chatCache.set(chatId, chat);
+                }
                 
                 // Update state
                 currentChatId = chatId;
@@ -756,6 +838,8 @@
                 if (chat.dataset) {
                     currentDataset = chat.dataset;
                     document.getElementById('current-dataset-indicator').textContent = currentDataset;
+                    // Validate that this dataset still exists
+                    validateAndSelectDataset();
                 }
                 
                 // Save the active chat ID to the server session
@@ -1069,7 +1153,12 @@
                             </div>
                         `;
                         
-                        chatEl.addEventListener('click', () => loadChat(chat.id));
+                        chatEl.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            console.log('Loading chat with ID:', chat.id);
+                            loadChat(chat.id);
+                        });
                         
                         // Delete chat button
                         const deleteBtn = chatEl.querySelector('.delete-chat-btn');
@@ -1159,6 +1248,16 @@
             }
         }
         
+        // Cache for datasets to avoid repeated fetches
+        let datasetsCache = null;
+        let datasetsCacheTime = 0;
+        const DATASETS_CACHE_DURATION = 30000; // 30 seconds cache
+        
+        function clearDatasetsCache() {
+            datasetsCache = null;
+            datasetsCacheTime = 0;
+        }
+        
         function viewDatasets() {
             // Remove any existing dataset modal first to ensure a clean state
             const existingModalInstance = document.querySelector('body > .fixed.inset-0.bg-black.bg-opacity-50');
@@ -1166,10 +1265,30 @@
                 existingModalInstance.remove();
             }
 
+            // Check if we have cached datasets
+            const now = Date.now();
+            if (datasetsCache && (now - datasetsCacheTime) < DATASETS_CACHE_DURATION) {
+                // Use cached data
+                renderDatasetsModal(datasetsCache);
+                return;
+            }
+
             // Fetch datasets from API
             fetch('/api/datasets')
                 .then(response => response.json())
                 .then(datasets => {
+                    // Cache the datasets
+                    datasetsCache = datasets;
+                    datasetsCacheTime = now;
+                    renderDatasetsModal(datasets);
+                })
+                .catch(error => {
+                    console.error('Error fetching datasets:', error);
+                    alert('Error loading datasets. Please try again.');
+                });
+        }
+        
+        function renderDatasetsModal(datasets) {
                     // Create a modal for dataset selection
                     const modalOverlay = document.createElement('div');
                     modalOverlay.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50';
@@ -1341,11 +1460,6 @@
 
                     // Event listeners for edit buttons are also added individually above within the loop.
                     // Removing the duplicated querySelectorAll for edit buttons.
-                })
-                .catch(error => {
-                    console.error('Error fetching datasets:', error);
-                    alert('Error loading datasets. Please try again.');
-                });
         }
         
         function processDocuments() {
@@ -1638,7 +1752,7 @@
 
                         // Close modal and refresh datasets
                         document.body.removeChild(modalOverlay);
-                        await viewDatasets();
+                        clearDatasetsCache(); // Clear cache so next open will fetch fresh data
                         showToast('Dataset created successfully!');
                     } catch (error) {
                         console.error('Error:', error);
@@ -1664,7 +1778,7 @@
                         if (modalOverlay && modalOverlay.parentNode) {
                             modalOverlay.parentNode.removeChild(modalOverlay);
                         }
-                        viewDatasets(); // Refresh the list
+                        clearDatasetsCache(); // Clear cache so next open will fetch fresh data
                     } catch (error) {
                         console.error('Error updating dataset:', error);
                         alert('Error updating dataset: ' + error.message);
@@ -1985,7 +2099,7 @@
                             if (modalElement && modalElement.parentNode) {
                                 modalElement.parentNode.removeChild(modalElement);
                             }
-                            viewDatasets(); // Refresh the list
+                            clearDatasetsCache(); // Clear cache so next open will fetch fresh data
                         } else {
                             throw new Error('Upload did not complete successfully');
                         }
@@ -2399,6 +2513,9 @@
                 }
 
                 if (response.ok && result.success) {
+                    // Clear datasets cache immediately after successful deletion
+                    clearDatasetsCache();
+                    
                     // Show success toast
                     const toastMsg = document.createElement('div');
                     toastMsg.className = 'toast-notification';

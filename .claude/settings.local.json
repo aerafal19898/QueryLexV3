@@ -27,7 +27,20 @@
       "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"DEFAULT_DATASETS\" app/templates/index.html)",
       "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"select.*dataset|dataset.*select\" app/templates/index.html -i)",
       "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n \"function viewDatasets\" app/templates/index.html -A 50)",
-      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -B 5 -A 15 \"datasetCard.addEventListener.*click\" app/templates/index.html)"
+      "Bash(/home/andri/.npm-global/lib/node_modules/@anthropic-ai/claude-code/vendor/ripgrep/x64-linux/rg -n -B 5 -A 15 \"datasetCard.addEventListener.*click\" app/templates/index.html)",
+      "Bash(chmod:*)",
+      "Bash(timeout:*)",
+      "Bash(pip3 list:*)",
+      "Bash(./venv/bin/python:*)",
+      "Bash(winget install:*)",
+      "Bash(sudo apt-get:*)",
+      "Bash(sudo apt-get install:*)",
+      "Bash(pip install:*)",
+      "Bash(where:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git config:*)",
+      "Bash(git push:*)"
     ],
     "deny": []
   }
