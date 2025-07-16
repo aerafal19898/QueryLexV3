@@ -177,6 +177,42 @@ models/
 *.pth
 *.onnx
 
+# Hugging Face cache
+~/.cache/huggingface/
+.huggingface/
+
+# NLTK data
+nltk_data/
+
+# Sentence transformers cache
+sentence_transformers/
+
+# Security keys (keep template, ignore actual keys)
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+!example.key
+
+# Tesseract and OCR temp files
+tessdata/
+*.tif
+*.tiff
+*.png.tmp
+*.jpg.tmp
+*.pdf.tmp
+
+# PDF processing temp files
+poppler-*/
+pdf2image_temp/
+*.poppler
+
+# Document processing temp files
+unstructured_temp/
+*.chunked
+*.embeddings
+
 # Migration and test files
 test_*.py
 *_migration.py
@@ -184,3 +220,43 @@ supabasetasks.md
 
 # Local configuration
 .claude/settings.local.json
+
+# Runtime files
+*.pid
+*.sock
+*.lock
+
+# Monitoring and metrics
+metrics/
+monitoring/
+*.metrics
+
+# Backup and recovery
+backups/
+*.backup
+*.restore
+
+# User-specific files
+.user_settings
+.personal_config
+
+# Platform-specific
+# Windows
+desktop.ini
+*.lnk
+
+# macOS
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Linux
+*~
+.directory
+
+# SSL certificates and keys
+ssl/
+certificates/
+*.csr
+*.ca-bundle

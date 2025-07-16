@@ -4,6 +4,15 @@
 # Linux: sudo apt-get install poppler-utils
 # macOS: brew install poppler
 
+# Tesseract OCR is required for text extraction. Install via:
+# Windows: winget install UB-Mannheim.TesseractOCR
+# Linux: sudo apt-get install tesseract-ocr
+# macOS: brew install tesseract
+
+# Build tools (required for Python 3.12 compatibility)
+setuptools>=68.0.0
+wheel>=0.40.0
+
 # Core Framework
 flask==2.3.3
 flask-cors==4.0.0
@@ -13,37 +22,61 @@ waitress==2.1.2
 
 # Security
 bcrypt==4.1.2
-cryptography==44.0.1
+cryptography>=41.0.0
 
 # Document Processing
 # Note: Poppler is required for PDF processing. Install via:
 # Windows: winget install poppler
 # Linux: sudo apt-get install poppler-utils
 # macOS: brew install poppler
-unstructured==0.10.30
-unstructured-inference==0.7.21
+
+# Using latest unstructured version (compatible with Python 3.12)
+unstructured>=0.18.0
+unstructured-inference>=0.7.21
 PyPDF2==3.0.1
 pdf2image==1.16.3
 pytesseract==0.3.10
+
+# Unstructured dependencies (explicitly included to avoid issues)
+python-magic-bin>=0.4.14; sys_platform == "win32"
+python-magic>=0.4.27
+pypandoc>=1.7.5
+markdown>=3.4.4
+msg-parser>=1.2.0
+xlrd>=2.0.1
+python-docx>=0.8.11
+python-pptx>=0.6.21
+openpyxl>=3.1.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.3
+pi-heif>=0.16.0
+unstructured_pytesseract>=0.3.12
+tabulate>=0.9.0
+python-multipart>=0.0.6
 
 # Vector Database
 supabase==2.8.1
 # Supabase dependencies will be auto-resolved by pip
 
-# ML & Embeddings
-torch==2.2.0
-transformers==4.35.2
-sentence-transformers==2.7.0
-huggingface-hub==0.19.4
-langchain-community==0.0.19
+# ML & Embeddings (Python 3.12 compatible versions)
+numpy>=1.26.0
+torch>=2.2.0
+transformers>=4.35.2
+sentence-transformers>=2.7.0
+huggingface-hub>=0.19.4
+langchain-community>=0.0.19
+
+# HTTP Client Dependencies
+httpx>=0.24.0
+httpcore>=0.17.0
+urllib3>=1.26.0
 
 # Utilities
-pillow==10.2.0
-tqdm==4.66.1
-nltk==3.8.1
-requests==2.31.0
-numpy==1.24.3
-anyio<4.0
+pillow>=10.2.0
+tqdm>=4.66.1
+nltk>=3.8.1
+requests>=2.31.0
+anyio>=3.6.0,<5.0
 
 # Production Server
-gunicorn==21.2.0
+gunicorn>=21.2.0

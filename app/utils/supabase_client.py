@@ -473,11 +473,11 @@ class SupabaseVectorClient:
             collection_id = collection["id"]
             
             # Use Supabase full-text search on content field
+            # Note: text_search doesn't support .limit() chaining, so we limit after execution
             result = self.client.table("documents")\
                 .select("*")\
                 .eq("collection_id", collection_id)\
                 .text_search("content", search_text)\
-                .limit(n_results)\
                 .execute()
             
             if not result.data:
@@ -486,8 +486,11 @@ class SupabaseVectorClient:
                     .select("*")\
                     .eq("collection_id", collection_id)\
                     .ilike("content", f"%{search_text}%")\
-                    .limit(n_results)\
                     .execute()
+            
+            # Manually limit results since .limit() doesn't work with text_search()
+            if result.data and len(result.data) > n_results:
+                result.data = result.data[:n_results]
             
             # Format results to match ChromaDB format
             documents = []
